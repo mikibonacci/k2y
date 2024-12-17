@@ -4,6 +4,8 @@ from ase.units import Ha
 from ase import io
 import xarray
 import itertools
+import numpy as np
+
 
 #from importlib.path import Path
 
@@ -20,6 +22,8 @@ class KcwQpDatabaseGenerator:
         ns_db1: path to the ns.db1 netcdf yambo file. This is used to generate the ndb_KI.QP and the K-points list for the interpolation of the
         KI eigenvalues.
         template_QP: path to the template.QP db used to generate the ndb_KI.QP.
+        
+        NOTE: if you are not using AiiDA, ns.db1 should have the same kpoints you are using in kcw, and the same number of bands (or more)...
         """
         
         if ns_db1:
@@ -29,7 +33,66 @@ class KcwQpDatabaseGenerator:
         if template_QP_path:
             print("storing the path of template.QP")
             self.template_QP_path = template_QP_path
+        else:
+            self.template_QP_path = self.get_templateQP_filepath()
+            
+    @classmethod
+    def get_templateQP_filepath(cls):
+        from importlib_resources import files
+
+        from . import templates
+        return files(templates) / 'template.QP'
     
+    @classmethod
+    def from_aiida(cls, yambo_node, kcw_node = None, on_grid = True, template_QP_path=None):
+        """Initialize the class from an AiiDA yambo and kcw node.
+        
+        we use the tempdir of the yambo node to init the self.ns_db1, and 
+        the tempdir of the kcw node to init the self.eigenvalues_KI.
+
+        Args:
+            yambo_node (_type_): _description_
+            kcw_node (_type_): _description_
+        """
+        
+        import tempfile
+        import pathlib
+        
+        from aiida import orm, load_profile
+        load_profile()
+        
+        from aiida_yambo.utils.common_helpers import find_pw_parent
+
+        
+        yambocalculation = orm.load_node(yambo_node)
+        kcwcalculation = orm.load_node(kcw_node) if kcw_node else None
+        
+        with tempfile.TemporaryDirectory() as dirpath: # actually skippable...
+            # Open the output file from the AiiDA storage and copy content to the temporary file
+            for filename in yambocalculation.outputs.retrieved.base.repository.list_object_names():
+                if 'ns.db1' in filename:
+                    # Create the file with the desired name
+                    temp_file = pathlib.Path(dirpath) / "ns.db1"
+                    with yambocalculation.outputs.retrieved.open(filename, 'rb') as handle:
+                        temp_file.write_bytes(handle.read())
+                    
+                    kcwqpdatabaseGenerator = cls(ns_db1=temp_file, template_QP_path=template_QP_path)
+        
+        if kcwcalculation:
+            if on_grid:
+                kcwqpdatabaseGenerator.eigenvalues_KI = np.array(kcwcalculation.outputs.output_parameters.get_dict()["pki_eigenvalues_on_grid"][-1])
+                kcwqpdatabaseGenerator.eigenvalues_KS = np.array(kcwcalculation.outputs.output_parameters.get_dict()["ks_eigenvalues_on_grid"][-1])
+                kcwqpdatabaseGenerator.kpoints = find_pw_parent(kcwcalculation).outputs.output_band.get_array('kpoints')
+                
+                # reshape the eigenvalues
+                kcwqpdatabaseGenerator.eigenvalues_KI = kcwqpdatabaseGenerator.eigenvalues_KI.reshape((kcwqpdatabaseGenerator.kpoints.shape[0],kcwqpdatabaseGenerator.eigenvalues_KI.shape[0]//kcwqpdatabaseGenerator.kpoints.shape[0]))
+                kcwqpdatabaseGenerator.eigenvalues_KS = kcwqpdatabaseGenerator.eigenvalues_KS.reshape((kcwqpdatabaseGenerator.eigenvalues_KI.shape[0],kcwqpdatabaseGenerator.eigenvalues_KI.shape[1]))
+                
+            else:
+                kcwqpdatabaseGenerator.eigenvalues_KI = np.array(kcwcalculation.outputs.output_parameters.get_dict()["eigenvalues"])
+        
+        return kcwqpdatabaseGenerator
+        
      
     def produce_kpoints_for_interpolation(self, filename=None):
         """Writes the Kpoints card for kcw.x interpolation. Kpoints are in cartesian coordinates in unit of 2pi/alat.
@@ -57,25 +120,31 @@ class KcwQpDatabaseGenerator:
                     
         return 
     
-    def set_koopmans_eval(self, path:str=None):
+    def set_koopmans_eval(self, path:str=None, output_ase=None):
+        # output_ase is if we already inspected the output file (e.g. aiida)
         
-        output = io.read(path)
+        output = io.read(path) if not output_ase else output_ase
         self.eigenvalues_KI = np.array(output.calc.results["eigenvalues"])
         
         return
     
-    def generate_mappings(self,):
+    def generate_mappings(self):
         
         ns = self.ns_db1
-        self.eigenvalues_KS = ns.variables["EIGENVALUES"].values[0] # not exactly, but we can map.
+        if not hasattr(self, 'eigenvalues_KI'):
+            self.eigenvalues_KS = ns.variables["EIGENVALUES"].values[0] # not exactly, but we can map.
+        else:
+            print("using the eigenvalues already stored.")
         
         # use the KI:
         eigenvalues = self.eigenvalues_KI
 
         print(f"shape eigenvalues: {np.shape(eigenvalues)}")
         
-        self.kpoints = ns.variables["K-POINTS"].values[:,:np.shape(eigenvalues)[0]] # exactly as in ndb.QP
-
+        if not hasattr(self, 'kpoints'):
+            self.kpoints = ns.variables["K-POINTS"].values[:,:np.shape(eigenvalues)[0]] # exactly as in ndb.QP
+        else:
+            print("using the kpoints already stored.")
 
         bands = [1,np.shape(eigenvalues)[0]*np.shape(eigenvalues)[1]]
         kpoints_ind = [1,np.shape(self.kpoints)[1]]
@@ -84,10 +153,10 @@ class KcwQpDatabaseGenerator:
         QP_kpts = self.kpoints # [[x],[y],[z]]
         QP_Eo = reshaped_eval_KS # [E_KS]
         QP_Z = [[1,0]]*(bands[1]-bands[0]+1) # [[Z.real,Z.imag]] <--- we don't care about this.
-        table_bands = [b_ind for b_ind in range(1,np.shape(eigenvalues)[1]+1)]*np.shape(self.kpoints)[1]
+        table_bands = [b_ind for b_ind in range(1,self.eigenvalues_KI.shape[-1]+1)]*self.kpoints.shape[0]
         
 
-        nested_list = [[k]*np.shape(eigenvalues)[1] for k in range(1,1+np.shape(self.kpoints)[1])]
+        nested_list = [[k]*self.eigenvalues_KI.shape[-1] for k in range(1,1+self.kpoints.shape[0])]
         table_kpoints = list(itertools.chain(*nested_list))
 
         QP_table = [table_bands,table_bands,table_kpoints]
@@ -102,7 +171,7 @@ class KcwQpDatabaseGenerator:
         self.mapped_vars = {
         'QP_QP_@_state_1_b_range': [1,np.shape(eigenvalues)[1]],
         'QP_QP_@_state_1_K_range': [1,kpoints_ind[-1]],
-        "QP_kpts": QP_kpts,
+        "QP_kpts": QP_kpts if QP_kpts.shape[0] == 3 else QP_kpts.T,
         "QP_E": QP_E,
         "QP_Eo": QP_Eo,
         "QP_Z": QP_Z,
@@ -113,7 +182,7 @@ class KcwQpDatabaseGenerator:
         # This mapping is done onto template.QP. You should always use it!!!
         self.mapped_dims = {
             'D_0000000064': [f"D_{str(len(QP_Eo)).zfill(10)}",len(QP_Eo)], # 
-            'D_0000000008': [f"D_{str(len(QP_kpts[0])).zfill(10)}",len(QP_kpts[0])], # 
+            'D_0000000008': [f"D_{str(QP_kpts.shape[0]).zfill(10)}",QP_kpts.shape[0]], # 
             #'D_0000000100': [f"D_{str(mapped_vars['QP_QP_@_state_1_b_range'][1]).zfill(10)}",mapped_vars['QP_QP_@_state_1_b_range'][1]], # 
         }
         
@@ -149,6 +218,7 @@ class KcwQpDatabaseGenerator:
                     else:
                         new_dims.append(v)
                 new_db.createVariable(var_name, var.dtype, new_dims)
+                print(var_name)
                 new_db.variables[var_name][:] = self.mapped_vars[var_name] if var_name in self.mapped_vars.keys() else var[:]
 
         # 3 Copy global attributes
@@ -162,11 +232,29 @@ class KcwQpDatabaseGenerator:
         
         return
     
+    def generate_QP_db_SinglefileData(self, filename:str="output.QP", temporary_dir:str=None):
+        """
+        This method is to be used with the SinglefileData class of AiiDA.
+        
+        Need to do this in a tempfile, if we want to use the workflow.
+        """
+        from aiida import orm, load_profile
+        load_profile()
+        
+        import os
+        
+        self.generate_QP_db(output_filename=filename)
+        new_db = orm.SinglefileData(file=os.path.abspath(filename))
+        new_db.store()
+        print(f"SinglefileData created, pk={new_db.pk}.")
+        
+        return new_db
+    
 """Usage example:
 
 converter = KcwQpDatabaseGenerator(
     ns_db1="/path/to/ns.db1",
-    template_QP_path="/path/to/template.QP"
+    #template_QP_path="/path/to/template.QP"
     )
     
 converter.set_koopmans_eval(path="/path/to/kc.kho")
