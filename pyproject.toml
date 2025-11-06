@@ -1,0 +1,86 @@
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "k2y"
+version = "0.1.0"  # Or use dynamic = ["version"] and define it in __init__.py
+description = "A package for simplifying Koopmans functionals calculations"
+authors = [{name = "Miki Bonacci", email = "mikibonacci@hotmail.it"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+]
+keywords = ["quantum", "chemistry", "physics", "koopmans"]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20.0",
+    "matplotlib>=3.4.0",
+    "click>=8.0.0",  # For CLI functionality
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/k2y"
+"Documentation" = "https://k2y.readthedocs.io/"
+"Bug Tracker" = "https://github.com/yourusername/k2y/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "mypy",
+    "pylint",
+    "pre-commit",
+]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
+
+[project.scripts]
+k2y = "k2y.cli:main"
+
+[tool.flit.module]
+name = "k2y"
+
+[tool.black]
+line-length = 100
+target-version = ["py38"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["k2y"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+
+[tool.coverage.run]
+source = ["k2y"]
+omit = ["tests/*"]
+
+[tool.pylint.messages_control]
+disable = [
+    "missing-docstring",
+    "invalid-name",
+]
+
+[tool.pylint.format]
+max-line-length = 100
