@@ -506,7 +506,7 @@ class KcwQpDatabaseGenerator:
         
         return kpoints, kpoints_type
     
-    def generate_mappings(self, time_rev:bool=True, brute_force:bool=True) -> None:
+    def generate_mappings(self, time_rev:bool=True, brute_force:bool=True, QP_E_consistent_QP_Eo=False) -> None:
         """
         Generate k-point and eigenvalue mappings between KCW and Yambo grids.
         
@@ -518,9 +518,11 @@ class KcwQpDatabaseGenerator:
         4. **Map k-points**: Match KCW k-points to Yambo k-point grid
         5. **Compute QP corrections**: Calculate ΔE = E_KI + (E_KS^KCW - E_KS^Yambo)
         
-        The QP correction formula ensures that when Yambo applies the correction:
+        The QP correction formula ensures that when Yambo applies the correction in the BSE:
             E_QP = E_KS^Yambo + ΔE
-        it yields the Koopmans eigenvalues E_KI.
+        it yields the Koopmans eigenvalues E_KI. E_KS^Yambo is the one from the ns.db1.
+        NB: however, setting QP_E_consistent_QP_Eo=True will instead compute E_QP = E_KI, so 
+        that QP_E - QP_Eo = E_KI - E_KS^(pw done within kcw). But this is not the standard way Yambo works. Use with care.
         
         Parameters
         ----------
@@ -595,6 +597,8 @@ class KcwQpDatabaseGenerator:
         --------
         This method modifies eigenvalues in place. If KCW has more bands than
         ns.db1, only the first n_bands will be included in the QP database.
+
+        NOTE: new_KI, new_KS are in eV. We convert to Ha only before writing in the db.
         """
         
         # Validate inputs before proceeding
@@ -708,9 +712,16 @@ class KcwQpDatabaseGenerator:
                 where = where_first[0]
             #new_KS[k,:] = self.eigenvalues_KS[where,:]
             #new_KI[k,:] = self.eigenvalues_KI[where,:]
-
-            eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands] + (self.eigenvalues_KS[where,:n_bands] - Ha*self.ns_db1_evalues[k,:n_bands])
-            eigenvalues_KS[k,:] = self.eigenvalues_KS[where,:n_bands]
+            if QP_E_consistent_QP_Eo:
+                # we want E_QP = E_KI, so the correction is just KI
+                raise NotImplementedError("QP_E_consistent_QP_Eo=True is not yet implemented and/or tested.")
+                eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands]
+                eigenvalues_KS[k,:] = self.eigenvalues_KS[where,:n_bands]
+            else:
+                # here we put the QP correction to be KI, and the KS to be the one of the ns.db1. In this way the E_minus_Eo is not the right one with respect to the KI, 
+                # but when applied to the ns.db1 KS eigenvalues it gives the right KI eigenvalues, which is what matters for Yambo.
+                eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands] #+ (self.eigenvalues_KS[where,:n_bands] - Ha*self.ns_db1_evalues[k,:n_bands])
+                eigenvalues_KS[k,:] = Ha*self.ns_db1_evalues[k,:n_bands] #self.eigenvalues_KS[where,:n_bands]
         
         logger.info(f"K-point mapping complete: {n_kpoints_yambo}/{n_kpoints_yambo} matched")
         
@@ -1053,7 +1064,7 @@ class KcwQpDatabaseGenerator:
     
 
     @classmethod
-    def from_aiida(cls, yambo_node_pk, kcw_node_pk = None, on_grid = True, template_QP_path=None, qp_template_node=None):
+    def from_aiida(cls, yambo_node_pk, kcw_node_pk = None, on_grid = True, template_QP_path=None, qp_template_node=None, spin=False):
         """Initialize the class from an AiiDA yambo and kcw node.
         
         we use the tempdir of the yambo node to init the self.ns_db1, and 
@@ -1085,7 +1096,7 @@ class KcwQpDatabaseGenerator:
                     with yambocalculation.outputs.retrieved.open(filename, 'rb') as handle:
                         temp_file.write_bytes(handle.read())
                     
-                    kcwqpdatabaseGenerator = cls(ns_db1=temp_file, template_QP_path=template_QP_path)
+                    kcwqpdatabaseGenerator = cls(ns_db1=temp_file, template_QP_path=template_QP_path, spin=spin)
                     
             if qp_template_node:
                 filename = "ndb.QP"
@@ -1114,18 +1125,29 @@ class KcwQpDatabaseGenerator:
         return kcwqpdatabaseGenerator
 
 
-"""Usage example:
+"""Usage example without AiiDA or hybrid (AiiDA for yambo, local for kcw):
 
 from k2y.k2y import KcwQpDatabaseGenerator
 
-converter = KcwQpDatabaseGenerator(
-    ns_db1="/path/to/ns.db1",
-    #template_QP_path="/path/to/template.QP"
-    )
+spin = True  # set to True if the KCW calculation is spin-polarized
+
+if not aiida_node:
+    converter = KcwQpDatabaseGenerator(
+        ns_db1="/path/to/ns.db1",
+        #template_QP_path="/path/to/template.QP"
+        spin=spin
+        )
+else:
+    converter = KcwQpDatabaseGenerator.from_aiida(
+        yambo_node_pk=1234,  # Replace with actual pk
+        kcw_node_pk=None,    # Replace with actual pk or None
+        #template_QP_path="/path/to/template.QP"
+        spin=spin
+        )
     
 converter.set_koopmans_eval(path="/path/to/kc.kho") # not needed if you are using AiiDA
 
-# Optional: Load k-points from pw.x input file
+# we need kpoints from the pw input
 converter.set_kpoints_from_pwinput("/path/to/pwnscf.in")
 
 converter.generate_mappings()
@@ -1134,6 +1156,23 @@ converter.verify_mappings(k_index=1, top_valence=10) # adjust k_index and top_va
 
 converter.generate_QP_db("out.QP")
 
+if aiida_node: 
+    # if you are using AiiDA, generate the SinglefileData
+    # you can also use the converter.generate_QP_db_SinglefileData() method
+    new_db = converter.generate_SinglefileData_from_file("out.QP")
+    new_db.store()
+
 #converter.produce_kpoints_for_interpolation() # to produce the k-points card for the interpolation, in the kcw.x run...
 
+"""
+
+"""Usage example with AiiDA:
+
+from k2y.aiida import generate_kcw_qp_database
+
+new_db = generate_kcw_qp_database(
+    yambo_node_pk=1234,  # Replace with actual pk
+    kcw_node_pk=5678,    # Replace with actual pk
+    QP_template_node=91011 # Replace with actual pk
+    )
 """
