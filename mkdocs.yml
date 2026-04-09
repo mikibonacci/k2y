@@ -1,0 +1,73 @@
+site_name: k2y
+site_url: https://mikibonacci.github.io/k2y
+repo_url: https://github.com/mikibonacci/k2y
+repo_name: k2y
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  features:
+  - navigation.top
+  - navigation.tabs
+  - navigation.tabs.sticky
+  - navigation.sections
+  - navigation.expand
+  - navigation.indexes
+  - navigation.footer
+  - toc.follow
+  - toc.integrate
+  - content.code.copy
+  - content.code.select
+  - content.code.annotate
+  palette:
+    # Palette toggle for automatic mode
+  - media: (prefers-color-scheme)
+    toggle:
+      icon: material/brightness-auto
+      name: Switch to light mode
+
+    # Palette toggle for light mode
+  - media: '(prefers-color-scheme: light)'
+    scheme: default
+    toggle:
+      icon: material/brightness-7
+      name: Switch to dark mode
+
+    # Palette toggle for dark mode
+  - media: '(prefers-color-scheme: dark)'
+    scheme: slate
+    toggle:
+      icon: material/brightness-4
+      name: Switch to system preference
+
+extra_css:
+- stylesheets/extra.css
+
+markdown_extensions:
+- attr_list
+- md_in_html
+- def_list
+- pymdownx.tasklist:
+    custom_checkbox: true
+- pymdownx.highlight:
+    anchor_linenums: true
+    line_spans: __span
+    pygments_lang_class: true
+- pymdownx.inlinehilite
+- pymdownx.snippets
+- pymdownx.superfences
+- admonition
+- pymdownx.details
+
+plugins:
+- search
+- git-revision-date-localized:
+    enable_creation_date: true
+
+nav:
+- Home: index.md
+- Getting Started: installation_quickstart/quickstart.md
+- Tutorials:
+  - Introduction: tutorials/index.md
+  - Silicon BSE with Koopmans: tutorials/silicon_bse.md

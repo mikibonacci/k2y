@@ -934,6 +934,7 @@ class KcwQpDatabaseGenerator:
         
         # Expand k-points to full BZ (cartesian), then convert to match kpoints_type
         expanded_kpoints, expanded_indexes, _ = self.yambopy_ns_db1.expand_kpoints() # this gives cartesian coordinates
+        expanded_kpoints_car = expanded_kpoints.copy()  # keep cartesian copy for QP_kpts
         if self.kpoints_type in ['reduced','crystal']:
             expanded_kpoints = car_red(expanded_kpoints,self.yambopy_ns_db1.rlat)
 
@@ -999,12 +1000,11 @@ class KcwQpDatabaseGenerator:
         logger.debug(f"Shape of the eigenvalues: {np.shape(eigenvalues)}")
         
         ###############################################################################
-        if not hasattr(self, 'kpoints') or self.kpoints is None:
-            self.kpoints = ns.variables["K-POINTS"].values[:,:np.shape(eigenvalues)[0]] # exactly as in ndb.QP
-        else:
-            logger.debug("Using k-points already stored")
-        
-        self.kpoints = ns.variables["K-POINTS"].values # exactly as in ndb.QP
+        # Use the full-BZ expanded k-points (cartesian, shape (3, n_kpoints_yambo))
+        # instead of ns.db1's IBZ-only K-POINTS (shape (3, n_kpoints_ibz)).
+        # The two would differ whenever symmetry expansion is needed (e.g. 3 IBZ → 8 full-BZ),
+        # which caused PARS to report 8 k-points / 160 states while QP_table only had 60 entries.
+        self.kpoints = expanded_kpoints_car.T  # shape (3, n_kpoints_yambo)
 
         bands = [1,np.shape(eigenvalues)[0]*np.shape(eigenvalues)[1]]
 

@@ -1,0 +1,51 @@
+#
+# Y88b    /   e           e    e      888~~\    ,88~-_
+#  Y88b  /   d8b         d8b  d8b     888   |  d888   \
+#   Y88b/   /Y88b       d888bdY88b    888 _/  88888    |
+#    Y8Y   /  Y88b     / Y88Y Y888b   888  \  88888    |
+#     Y   /____Y88b   /   YY   Y888b  888   |  Y888   /
+#    /   /      Y88b /          Y888b 888__/    `88_-~
+#
+#             AIIDA input plugin.  YAMBO >4.0 compatible
+#               http://www.yambo-code.org
+#
+bse
+bss
+WRbsWF
+em1s
+rim_cut
+optics
+dipoles
+NLCC
+Lkind =     'full'
+BSEmod = 'resonant'
+BSKmod =      'SEX'
+BSSmod =        'd'
+Chimod =  'hartree'
+% BSEQptR
+ 1 | 1 |   
+%
+KfnQPdb = 'E < ./ndb.QP'
+% BDmRange
+ 0.1 | 0.1 |  eV 
+%
+% BEnRange
+ 0 | 10 |  eV 
+%
+BEnSteps = 1000 
+% BLongDir
+ 1.0 | 1.0 | 1.0 |   
+%
+% BSEBands
+ 4 | 5 |   
+%
+BSENGBlk = 2 Ry
+% BndsRnXs
+ 1 | 100 |   
+%
+% LongDrXs
+ 1.0 | 1.0 | 1.0 |   
+%
+NGsBlkXs = 2 Ry
+DysSolver =        'n'
+X_and_IO_nCPU_LinAlg_INV = 1

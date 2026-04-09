@@ -26,11 +26,12 @@ dependencies = [
     "netCDF4>=1.5.0",
     "ase>=3.22.0",       # base ASE; k2y requires ase-koopmans (fork) — see below
     "xarray>=0.16.0",
+    "importlib_resources>=5.0.0",
     # The following packages are NOT on PyPI and must be installed from source:
     #   ase-koopmans  (Koopmans fork of ASE: https://github.com/mikibonacci/ase_koopmans, branch add/pKI_diag)
-    #                 pip install -e git+https://github.com/mikibonacci/ase_koopmans.git@add/pKI_diag#egg=ase-koopmans
+    #                 pip install git+https://github.com/mikibonacci/ase_koopmans.git@add/pKI_diag#egg=ase-koopmans
     #   yambopy       (Yambo Python library: https://github.com/mikibonacci/yambopy, branch aiida-parsing)
-    #                 pip install -e git+https://github.com/mikibonacci/yambopy.git@aiida-parsing#egg=yambopy
+    #                 pip install git+https://github.com/mikibonacci/yambopy.git@aiida-parsing#egg=yambopy
 ]
 
 [project.urls]
@@ -51,8 +52,8 @@ dev = [
     "pre-commit",
 ]
 docs = [
-    "sphinx",
-    "sphinx-rtd-theme",
+    "mkdocs-material>=9.0",
+    "mkdocs-git-revision-date-localized-plugin>=1.2",
 ]
 
 [project.scripts]
