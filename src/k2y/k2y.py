@@ -25,7 +25,7 @@ from ase_koopmans import io
 import xarray
 import itertools
 import numpy as np
-from yambopy import YamboSaveDB
+from yambopy import YamboElectronsDB
 from yambopy.lattice import car_red, red_car
 
 # Set up module logger
@@ -58,7 +58,7 @@ class KcwQpDatabaseGenerator:
     ----------
     ns_db1 : xarray.Dataset
         Yambo ns.db1 database containing KS eigenvalues and k-points
-    yambopy_ns_db1 : YamboSaveDB
+    yambopy_ns_db1 : YamboElectronsDB
         YamboPy interface to ns.db1
     template_QP_path : Path
         Path to template QP database
@@ -143,7 +143,7 @@ class KcwQpDatabaseGenerator:
             print(f"Reading ns.db1 from: {ns_db1}")
             self.ns_db1 = xarray.open_dataset(ns_db1, engine='netcdf4')
             ns_dir = str(ns_db1).replace('/ns.db1', '')
-            self.yambopy_ns_db1 = YamboSaveDB.from_db_file(ns_dir)
+            self.yambopy_ns_db1 = YamboElectronsDB.from_db_file(folder=ns_dir, Expand=True)
             self.save_dir = Path(ns_db1).parent
             
         if template_QP_path:
@@ -606,7 +606,7 @@ class KcwQpDatabaseGenerator:
         ns = self.ns_db1
 
         if full_BZ:
-            kpoints = self.yambopy_ns_db1.expand_kpts()[0]
+            kpoints = self.yambopy_ns_db1.expand_kpoints()[0]
         else:
             kpoints = self.yambopy_ns_db1.car_kpoints
 
@@ -905,7 +905,7 @@ class KcwQpDatabaseGenerator:
         # we expand the kpoints to the full grid, so we have the mapping
         # between the kpoints in the ns.db1 and the kpoints in the koopmans KS/KI.
         
-        self.yambopy_ns_db1.expand_kpts()
+        self.yambopy_ns_db1.expand_kpoints()
         
         # Determine the number of bands to use: minimum between KCW and ns.db1
         n_bands_ns_db1 = self.ns_db1_evalues.shape[1]
@@ -932,21 +932,25 @@ class KcwQpDatabaseGenerator:
         #new_KS = np.zeros((n_kpoints_yambo, n_bands))
         #new_KI = np.zeros((n_kpoints_yambo, n_bands))
         
-        # Use only the bands that are available in both databases
-        eigenvalues = self.eigenvalues_KI[:n_kpoints_yambo,:n_bands].copy()
-        eigenvalues_KS = self.eigenvalues_KS[:n_kpoints_yambo,:n_bands].copy()
-
-        expanded_kpoints, expanded_indexes, _ = self.yambopy_ns_db1.expand_kpts() # this gives cartesian coordinates
+        # Expand k-points to full BZ (cartesian), then convert to match kpoints_type
+        expanded_kpoints, expanded_indexes, _ = self.yambopy_ns_db1.expand_kpoints() # this gives cartesian coordinates
         if self.kpoints_type in ['reduced','crystal']:
             expanded_kpoints = car_red(expanded_kpoints,self.yambopy_ns_db1.rlat)
+
+        # Allocate output arrays with full-BZ size
+        eigenvalues = np.zeros((n_kpoints_yambo, n_bands))
+        eigenvalues_KS = np.zeros((n_kpoints_yambo, n_bands))
 
         logger.info("Mapping k-points between KCW and Yambo grids...")
         matched_kpoints = 0
         for k in range(n_kpoints_yambo):
-            where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw - self.yambopy_ns_db1.red_kpoints[k])<DEFAULT_KPOINT_TOLERANCE, axis=1))[0]
+            # expanded_kpoints[k] is the k-th full-BZ kpoint (already in the right coordinate system)
+            where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw - expanded_kpoints[k])<DEFAULT_KPOINT_TOLERANCE, axis=1))[0]
             if len(where_first) == 0:
                 logger.debug(f"K-point {k} not found directly, trying expanded grid...")
-                where_this_kpoint = np.where(expanded_indexes == k)[0]
+                # find all full-BZ kpoints sharing the same IBZ kpoint as k
+                ibz_idx = expanded_indexes[k]
+                where_this_kpoint = np.where(expanded_indexes == ibz_idx)[0]
                 # we then search for the kpoint in the expanded kpoints, but we still use the index k.:
                 for kpoint in expanded_kpoints[where_this_kpoint]:
                     where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw - kpoint)<DEFAULT_KPOINT_TOLERANCE, axis=1))[0]
@@ -979,8 +983,10 @@ class KcwQpDatabaseGenerator:
             else:
                 # here we put the QP correction to be KI, and the KS to be the one of the ns.db1. In this way the E_minus_Eo is not the right one with respect to the KI, 
                 # but when applied to the ns.db1 KS eigenvalues it gives the right KI eigenvalues, which is what matters for Yambo.
-                eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands] #+ (self.eigenvalues_KS[where,:n_bands] - Ha*self.ns_db1_evalues[k,:n_bands])
-                eigenvalues_KS[k,:] = Ha*self.ns_db1_evalues[k,:n_bands] #self.eigenvalues_KS[where,:n_bands]
+                eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands]
+                # use IBZ index for ns_db1_evalues (shape: n_kpoints_ibz, n_bands)
+                ibz_k = expanded_indexes[k]
+                eigenvalues_KS[k,:] = Ha*self.ns_db1_evalues[ibz_k,:n_bands]
         
         logger.info(f"K-point mapping complete: {n_kpoints_yambo}/{n_kpoints_yambo} matched")
         
