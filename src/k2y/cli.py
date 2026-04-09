@@ -1,121 +1,244 @@
 #!/usr/bin/env python3
 """
 Command line interface for the k2y package.
-Provides tools for working with Koopmans functionals calculations.
+Provides tools for converting Koopmans eigenvalues into Yambo QP databases.
 """
 
-import os
 import sys
-import json
 from pathlib import Path
 
 import click
 
+
 @click.group()
 @click.version_option()
 def main():
-    """k2y: Tools interfacing kcw.x and Yambo codes.
-    
-    This tool helps prepare and analyze kcw.x data to be used within the Yambo code.
+    """k2y: Convert Koopmans (kcw.x) eigenvalues into Yambo QP databases.
+
+    Supports two modes:
+
+    \b
+    File mode  – provide ns.db1, a .kho eigenvalue file, and a pw.x input used for the nscf kcw run.
+    AiiDA mode – provide Yambo and KCW node PKs from an AiiDA database.
     """
     pass
 
 
-@main.command('run')
-@click.argument('input_file', type=click.Path(exists=True))
-@click.option('--output-dir', '-o', type=click.Path(), 
-              help='Directory to store calculation results')
-@click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
-def run_calculation(input_file, output_dir, verbose):
-    """Run a Koopmans functional calculation.
-    
-    INPUT_FILE should be a JSON configuration file for the calculation.
+# ---------------------------------------------------------------------------
+# generate
+# ---------------------------------------------------------------------------
+
+@main.command('generate')
+# --- file-mode inputs -------------------------------------------------------
+@click.option('--ns-db1', type=click.Path(), default=None,
+              help='Path to Yambo ns.db1 file (SAVE/ directory). '
+                   'Required in file mode.')
+@click.option('--eval', 'koopmans_eval', type=click.Path(), default=None,
+              help='Path to the kcw.x output file containing Koopmans eigenvalues '
+                   '(must be readable by ase_koopmans.io, typically a .kho file). '
+                   'Required in file mode (or hybrid AiiDA/file mode).')
+@click.option('--pwinput', type=click.Path(), default=None,
+              help='Path to the pw.x input file used for the KCW calculation. '
+                   'Must contain the same k-point grid as the KCW run. Required in file mode.')
+# --- AiiDA-mode inputs ------------------------------------------------------
+@click.option('--yambo-pk', type=int, default=None,
+              help='AiiDA node PK of the Yambo calculation. '
+                   'Activates AiiDA mode.')
+@click.option('--kcw-pk', type=int, default=None,
+              help='AiiDA node PK of the KCW calculation (optional in AiiDA mode). '
+                   'If omitted, --eval and --pwinput must be provided.')
+# --- common options ---------------------------------------------------------
+@click.option('--template-qp', type=click.Path(), default=None,
+              help='Path to a custom template ndb.QP file. '
+                   'If omitted, the bundled template is used.')
+@click.option('--spin', is_flag=True, default=False,
+              help='Use the spin-polarised bundled template '
+                   '(ignored when --template-qp is given).')
+@click.option('--output', '-o', default='ndb.QP',
+              help='Output QP database filename. [default: ndb.QP]')
+@click.option('--time-rev/--no-time-rev', default=True,
+              help='Use time-reversal symmetry when matching k-points. '
+                   '[default: --time-rev]')
+@click.option('--brute-force/--no-brute-force', default=True,
+              help='Fall back to brute-force |k| matching. '
+                   '[default: --brute-force]')
+# --- verification options ---------------------------------------------------
+@click.option('--verify-k', type=int, default=None,
+              help='1-based k-point index used for mapping verification.')
+@click.option('--verify-tv', type=int, default=None,
+              help='1-based top-valence band index used for mapping verification.')
+# --- AiiDA store option -----------------------------------------------------
+@click.option('--store', is_flag=True, default=False,
+              help='Store the output as an AiiDA SinglefileData node '
+                   '(AiiDA mode only).')
+def generate(ns_db1, koopmans_eval, pwinput,
+             yambo_pk, kcw_pk,
+             template_qp, spin, output,
+             time_rev, brute_force,
+             verify_k, verify_tv,
+             store):
+    """Generate a Yambo QP database from Koopmans eigenvalues.
+
+    \b
+    File mode example:
+      k2y generate --ns-db1 SAVE/ns.db1 --eval kc.kho --pwinput nscf.in
+
+    \b
+    AiiDA mode example (full):
+      k2y generate --yambo-pk 1234 --kcw-pk 5678
+
+    \b
+    Hybrid mode (AiiDA Yambo + local KCW files):
+      k2y generate --yambo-pk 1234 --eval kc.kho --pwinput nscf.in
     """
-    if verbose:
-        click.echo(f"Starting calculation with input file: {input_file}")
-    
+    from k2y.k2y import KcwQpDatabaseGenerator
+
+    aiida_mode = yambo_pk is not None
+
+    # ------------------------------------------------------------------
+    # Input validation
+    # ------------------------------------------------------------------
+    if not aiida_mode:
+        missing = []
+        if not ns_db1:
+            missing.append('--ns-db1')
+        if not koopmans_eval:
+            missing.append('--eval')
+        if not pwinput:
+            missing.append('--pwinput')
+        if missing:
+            raise click.UsageError(
+                f"File mode requires: {', '.join(missing)}. "
+                "Alternatively, use --yambo-pk to switch to AiiDA mode."
+            )
+    else:
+        # AiiDA mode: if kcw-pk is absent we need the local files
+        if kcw_pk is None:
+            missing = []
+            if not koopmans_eval:
+                missing.append('--eval')
+            if not pwinput:
+                missing.append('--pwinput')
+            if missing:
+                raise click.UsageError(
+                    f"When --kcw-pk is not provided, {', '.join(missing)} are required "
+                    "(hybrid mode: AiiDA Yambo + local KCW files)."
+                )
+
+    # ------------------------------------------------------------------
+    # Build converter
+    # ------------------------------------------------------------------
     try:
-        with open(input_file, 'r') as f:
-            config = json.load(f)
-        
-        # Here you would implement the actual calculation logic
-        click.echo("Running Koopmans functional calculation...")
-        
-        # Example placeholder for actual implementation
-        from k2y.core import run_koopmans_calculation
-        results = run_koopmans_calculation(config, output_dir)
-        
-        click.echo(f"Calculation completed successfully!")
-    except Exception as e:
-        click.echo(f"Error during calculation: {str(e)}", err=True)
+        if aiida_mode:
+            click.echo(f"AiiDA mode: yambo_pk={yambo_pk}, kcw_pk={kcw_pk}")
+            converter = KcwQpDatabaseGenerator.from_aiida(
+                yambo_node_pk=yambo_pk,
+                kcw_node_pk=kcw_pk,
+                template_QP_path=template_qp,
+                spin=spin,
+            )
+        else:
+            click.echo("File mode")
+            converter = KcwQpDatabaseGenerator(
+                ns_db1=ns_db1,
+                template_QP_path=template_qp,
+                spin=spin,
+            )
+
+        # Set eigenvalues from file when not provided by AiiDA
+        if koopmans_eval is not None:
+            click.echo(f"Loading Koopmans eigenvalues from: {koopmans_eval}")
+            converter.set_koopmans_eval(path=koopmans_eval)
+
+        # Set k-points from pw.x input when not provided by AiiDA
+        if pwinput is not None:
+            click.echo(f"Loading k-points from: {pwinput}")
+            converter.set_kpoints_from_pwinput(pwinput)
+
+        click.echo(converter.summary())
+
+        # ------------------------------------------------------------------
+        # Core workflow
+        # ------------------------------------------------------------------
+        click.echo("Generating mappings...")
+        converter.generate_mappings(time_rev=time_rev, brute_force=brute_force)
+
+        if verify_k is not None and verify_tv is not None:
+            click.echo(f"Verifying mappings at k={verify_k}, top_valence={verify_tv}...")
+            converter.verify_mappings(k_index=verify_k, top_valence=verify_tv)
+
+        click.echo(f"Writing QP database to: {output}")
+        converter.generate_QP_db(output_filename=output)
+
+        if store:
+            if not aiida_mode:
+                click.echo("Warning: --store is only meaningful in AiiDA mode.", err=True)
+            else:
+                click.echo("Storing output as AiiDA SinglefileData...")
+                node = KcwQpDatabaseGenerator.generate_SinglefileData_from_file(output)
+                node.store()
+                click.echo(f"Stored with pk={node.pk}")
+
+        click.echo("Done.")
+
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
 
 
-@main.command('convert')
-@click.argument('input_file', type=click.Path(exists=True))
-@click.argument('output_format', type=click.Choice(['json', 'yaml', 'xml']))
-@click.option('--output-file', '-o', type=click.Path(), help='Output file path')
-def convert_data(input_file, output_format, output_file):
-    """Convert data files between formats.
-    
-    INPUT_FILE is the file to convert.
-    OUTPUT_FORMAT is the desired output format.
+# ---------------------------------------------------------------------------
+# kpoints
+# ---------------------------------------------------------------------------
+
+@main.command('kpoints')
+@click.option('--ns-db1', type=click.Path(exists=True), required=True,
+              help='Path to Yambo ns.db1 file.')
+@click.option('--output', '-o', type=click.Path(), default=None,
+              help='Write K_POINTS card to this file (default: print to stdout).')
+@click.option('--coordinates', type=click.Choice(['crystal', 'tpiba']),
+              default='crystal', show_default=True,
+              help='Coordinate system for k-points.')
+@click.option('--full-bz', is_flag=True, default=False,
+              help='Expand irreducible BZ to full Brillouin zone.')
+def kpoints(ns_db1, output, coordinates, full_bz):
+    """Print the K_POINTS card from a Yambo ns.db1 file.
+
+    Useful for setting up a kcw.x interpolation run that covers
+    exactly the same k-point grid as the Yambo calculation.
+
+    \b
+    Example:
+      k2y kpoints --ns-db1 SAVE/ns.db1 --output kpoints.txt
     """
-    if output_file is None:
-        output_file = f"{os.path.splitext(input_file)[0]}.{output_format}"
-    
-    click.echo(f"Converting {input_file} to {output_format} format...")
-    # Implementation of the conversion logic would go here
-    click.echo(f"File converted and saved to {output_file}")
+    from k2y.k2y import KcwQpDatabaseGenerator
+
+    try:
+        converter = KcwQpDatabaseGenerator(ns_db1=ns_db1)
+        converter.produce_kpoints_for_interpolation(
+            filename=output,
+            coordinates=coordinates,
+            full_BZ=full_bz,
+        )
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
 
 
-@main.command('plot')
-@click.argument('data_file', type=click.Path(exists=True))
-@click.option('--plot-type', '-p', type=click.Choice(['bands', 'dos', 'orbital']), 
-              default='bands', help='Type of plot to generate')
-@click.option('--output', '-o', type=click.Path(), help='Save plot to file')
-@click.option('--show', is_flag=True, help='Display plot')
-def plot_results(data_file, plot_type, output, show):
-    """Generate plots from calculation results.
-    
-    DATA_FILE is the file containing calculation results.
-    """
-    click.echo(f"Generating {plot_type} plot from {data_file}...")
-    
-    # Implementation of plotting logic would go here
-    # Example placeholder:
-    # from k2y.plotting import generate_plot
-    # generate_plot(data_file, plot_type, output_file=output, show=show)
-    
-    if output:
-        click.echo(f"Plot saved to {output}")
-    
+# ---------------------------------------------------------------------------
+# info
+# ---------------------------------------------------------------------------
 
 @main.command('info')
-@click.argument('file', type=click.Path(exists=True), required=False)
-def show_info(file):
-    """Display information about a calculation file or the environment.
-    
-    If FILE is provided, shows details about the file.
-    Otherwise, shows information about the k2y environment.
-    """
-    if file:
-        click.echo(f"File information for: {file}")
-        # Implementation to show file info would go here
-    else:
-        click.echo("K2Y Environment Information:")
-        click.echo(f"Python version: {sys.version.split()[0]}")
-        click.echo(f"K2Y version: {get_version()}")
-        # Additional environment information
-
-
-def get_version():
-    """Return the package version."""
+def show_info():
+    """Display k2y environment information."""
     try:
-        from importlib.metadata import version
-        return version("k2y")
-    except:
-        return "unknown"
+        from importlib.metadata import version as pkg_version
+        v = pkg_version("k2y")
+    except Exception:
+        v = "unknown"
+
+    click.echo(f"k2y version : {v}")
+    click.echo(f"Python      : {sys.version.split()[0]}")
 
 
 if __name__ == '__main__':

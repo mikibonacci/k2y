@@ -144,6 +144,7 @@ class KcwQpDatabaseGenerator:
             self.ns_db1 = xarray.open_dataset(ns_db1, engine='netcdf4')
             ns_dir = str(ns_db1).replace('/ns.db1', '')
             self.yambopy_ns_db1 = YamboSaveDB.from_db_file(ns_dir)
+            self.save_dir = Path(ns_db1).parent
             
         if template_QP_path:
             template_path = Path(template_QP_path)
@@ -162,8 +163,251 @@ class KcwQpDatabaseGenerator:
         self.eigenvalues_KI = None
         self.eigenvalues_KS = None
         self.kpoints_grid_kcw = None
-        self.kpoints_type = None 
+        self.kpoints_type = None
+
+        if ns_db1 and self.template_QP_path:
+            self.check_version_compatibility(auto_select=True)
             
+    def check_version_compatibility(self, auto_select: bool = True) -> None:
+        """
+        Check that the Yambo version used to generate the SAVE directory is
+        compatible with the template ndb.QP file.
+
+        Version information is read from `ndb.gops` or `ndb.kindx` (whichever
+        is found first) in the same directory as ns.db1, and compared against
+        the `HEAD_VERSION` variable in the template QP file.
+
+        When a mismatch is detected the bundled templates are scanned and the
+        closest one (by version tuple proximity) is reported.  If
+        ``auto_select=True`` (the default) and a bundled template is closer
+        than the current one, ``self.template_QP_path`` is updated
+        automatically.
+
+        Parameters
+        ----------
+        auto_select : bool, default=True
+            If True and a closer bundled template is found, switch to it
+            automatically and emit a warning.  If False, only warn without
+            switching.
+
+        Notes
+        -----
+        `ns.db1` itself does not store a reliable version number (GPL_REVISION
+        is zero in all known Yambo releases).  The sibling files `ndb.gops` and
+        `ndb.kindx` do carry `HEAD_VERSION` / `HEAD_REVISION` and are always
+        present in a valid SAVE directory.
+        """
+        save_dir = getattr(self, 'save_dir', None)
+        if save_dir is None:
+            logger.debug("save_dir not set; skipping version check.")
+            return
+
+        # --- read Yambo version from SAVE directory ---
+        yambo_version = None
+        yambo_revision = None
+        for candidate in ('ndb.gops', 'ndb.kindx'):
+            candidate_path = save_dir / candidate
+            if candidate_path.exists():
+                try:
+                    with nc.Dataset(str(candidate_path)) as db:
+                        if 'HEAD_VERSION' in db.variables:
+                            yambo_version = list(db.variables['HEAD_VERSION'][:])
+                        if 'HEAD_REVISION' in db.variables:
+                            yambo_revision = int(db.variables['HEAD_REVISION'][:][0])
+                    break
+                except Exception:
+                    pass
+
+        if yambo_version is None:
+            logger.debug(
+                "Could not determine Yambo version from SAVE directory "
+                f"(checked {save_dir}/ndb.gops and ndb.kindx)."
+            )
+            return
+
+        # --- read version from current template ---
+        tpl_version = None
+        tpl_revision = None
+        try:
+            with nc.Dataset(str(self.template_QP_path)) as db:
+                if 'HEAD_VERSION' in db.variables:
+                    tpl_version = list(db.variables['HEAD_VERSION'][:])
+                if 'HEAD_REVISION' in db.variables:
+                    tpl_revision = int(db.variables['HEAD_REVISION'][:][0])
+        except Exception:
+            pass
+
+        if tpl_version is None:
+            logger.debug("Could not read HEAD_VERSION from template QP file.")
+            return
+
+        yambo_ver_str = '.'.join(str(int(x)) for x in yambo_version)
+        tpl_ver_str   = '.'.join(str(int(x)) for x in tpl_version)
+
+        if yambo_version == tpl_version:
+            logger.info(
+                f"Version check passed: SAVE and template QP both target "
+                f"Yambo {yambo_ver_str} (rev {yambo_revision})."
+            )
+            return
+
+        # --- mismatch: look for a better bundled template ---
+        spin = getattr(self, '_spin', False)  # stored by __init__ if needed
+        best = self.find_best_template(yambo_version, spin=spin)
+        best_ver_str = '.'.join(str(int(x)) for x in best['version'])
+
+        def _distance(v_a, v_b):
+            """Weighted distance: major*100 + minor*10 + patch."""
+            weights = (100, 10, 1)
+            return sum(w * abs(int(a) - int(b)) for w, a, b in zip(weights, v_a, v_b))
+
+        current_dist = _distance(yambo_version, tpl_version)
+        best_dist    = _distance(yambo_version, best['version'])
+
+        if int(yambo_version[0]) != int(tpl_version[0]):
+            severity = "major version mismatch"
+        else:
+            severity = "minor version mismatch"
+
+        if best_dist < current_dist:
+            msg = (
+                f"Yambo {severity}: SAVE directory was generated with "
+                f"Yambo {yambo_ver_str} (rev {yambo_revision}), "
+                f"current template targets {tpl_ver_str} (rev {tpl_revision}). "
+                f"A closer bundled template was found: '{best['name']}' "
+                f"(Yambo {best_ver_str}, rev {best['revision']}). "
+            )
+            if auto_select:
+                self.template_QP_path = best['path']
+                msg += "Switched to it automatically."
+            else:
+                msg += (
+                    f"Consider using it via: "
+                    f"KcwQpDatabaseGenerator.get_templateQP_filepath() "
+                    f"or passing template_QP_path='{best['path']}'."
+                )
+        else:
+            msg = (
+                f"Yambo {severity}: SAVE directory was generated with "
+                f"Yambo {yambo_ver_str} (rev {yambo_revision}), "
+                f"template targets {tpl_ver_str} (rev {tpl_revision}). "
+                f"No closer bundled template found (best available: "
+                f"'{best['name']}' at {best_ver_str}). "
+                "Consider providing a custom template_QP_path."
+            )
+
+        warnings.warn(msg, UserWarning, stacklevel=3)
+
+    @classmethod
+    def list_bundled_templates(cls) -> list:
+        """
+        Return metadata for every bundled ndb.QP template file.
+
+        Returns
+        -------
+        list of dict
+            Each dict has keys:
+
+            * ``'name'`` – filename (str)
+            * ``'path'`` – :class:`pathlib.Path` to the file
+            * ``'version'`` – ``[major, minor, patch]`` as floats, or ``None``
+            * ``'revision'`` – int revision number, or ``None``
+            * ``'spin'`` – ``True`` if SPIN_VARS[0] > 1
+
+        Examples
+        --------
+        >>> for t in KcwQpDatabaseGenerator.list_bundled_templates():
+        ...     print(t['name'], t['version'], t['spin'])
+        template.QP [5.0, 2.0, 1.0] False
+        template_v510.QP [5.0, 1.0, 2.0] False
+        template_v530.QP [5.0, 3.0, 0.0] False
+        template_v530_spin.QP [5.0, 3.0, 0.0] True
+        """
+        from importlib_resources import files
+        from . import templates as _templates_pkg
+
+        tpl_dir = files(_templates_pkg)
+        results = []
+        for name in sorted(p.name for p in tpl_dir.iterdir()):
+            if not name.endswith('.QP'):
+                continue
+            path = tpl_dir / name
+            entry = {'name': name, 'path': path, 'version': None,
+                     'revision': None, 'spin': False}
+            try:
+                with nc.Dataset(str(path)) as db:
+                    if 'HEAD_VERSION' in db.variables:
+                        entry['version'] = list(db.variables['HEAD_VERSION'][:])
+                    if 'HEAD_REVISION' in db.variables:
+                        entry['revision'] = int(db.variables['HEAD_REVISION'][:][0])
+                    if 'SPIN_VARS' in db.variables:
+                        entry['spin'] = int(db.variables['SPIN_VARS'][:][0]) > 1
+            except Exception:
+                pass
+            results.append(entry)
+        return results
+
+    @classmethod
+    def find_best_template(cls, yambo_version: list, spin: bool = False) -> dict:
+        """
+        Find the bundled template whose Yambo version is closest to
+        ``yambo_version``.
+
+        The search is restricted to templates whose spin character matches the
+        ``spin`` argument.  Closeness is defined as the sum of squared
+        differences across ``[major, minor, patch]``; in case of a tie the
+        template with the higher revision number wins.
+
+        Parameters
+        ----------
+        yambo_version : list
+            Target version as ``[major, minor, patch]`` (floats or ints).
+        spin : bool, default=False
+            If True, consider only spin-polarised templates; otherwise only
+            non-spin templates.
+
+        Returns
+        -------
+        dict
+            The metadata dict (as returned by :meth:`list_bundled_templates`)
+            for the best-matching template.
+
+        Raises
+        ------
+        RuntimeError
+            If no bundled template with known version information is found.
+
+        Examples
+        --------
+        >>> best = KcwQpDatabaseGenerator.find_best_template([5, 1, 0])
+        >>> print(best['name'], best['version'])
+        template_v510.QP [5.0, 1.0, 2.0]
+        """
+        def _distance(v_a, v_b):
+            return sum((int(a) - int(b)) ** 2 for a, b in zip(v_a, v_b))
+
+        candidates = [
+            t for t in cls.list_bundled_templates()
+            if t['version'] is not None and t['spin'] == spin
+        ]
+        if not candidates:
+            raise RuntimeError(
+                "No bundled templates with version information found "
+                f"(spin={spin})."
+            )
+
+        def _distance(v_a, v_b):
+            """Weighted distance: major*100 + minor*10 + patch, so minor version
+            matches are always preferred over patch proximity to a different minor."""
+            weights = (100, 10, 1)
+            return sum(w * abs(int(a) - int(b)) for w, a, b in zip(weights, v_a, v_b))
+
+        candidates.sort(
+            key=lambda t: (_distance(yambo_version, t['version']),
+                           -(t['revision'] or 0))
+        )
+        return candidates[0]
+
     @classmethod
     def get_templateQP_filepath(cls, spin: bool = False) -> Path:
         """
@@ -203,7 +447,7 @@ class KcwQpDatabaseGenerator:
 
         from . import templates
         return files(templates) / f'template_v530{"_spin" if spin else ""}.QP'
-    
+
     def validate_inputs(self) -> Dict[str, bool]:
         """
         Validate that all required inputs are set.
@@ -423,9 +667,10 @@ class KcwQpDatabaseGenerator:
             
         Notes
         -----
-        Currently implemented primarily for AiiDA workflows. Direct file reading
-        from kcw.x output files is not yet fully supported.
-        
+        If the file does not have a `.kho` extension, a temporary copy is created
+        with that extension so that `ase_koopmans.io` can dispatch to the correct
+        format reader automatically.
+
         The eigenvalues are stored as flattened arrays and will be reshaped
         during the generate_mappings() step based on the k-point grid.
         
@@ -436,27 +681,41 @@ class KcwQpDatabaseGenerator:
         >>> print(converter.eigenvalues_KI.shape)  # Flattened
         (12800,)
         
-        See Also
-        --------
-        set_kpoints_from_pwinput : Load corresponding k-point grid
-        generate_mappings : Reshape and map eigenvalues to Yambo grid
-        from_aiida : Alternative initialization from AiiDA calculations
-        
-        Warnings
-        --------
-        This method prints a warning about limited file format support.
+        >>> # Also works with non-.kho extensions (e.g. kcw.x stdout):
+        >>> converter.set_koopmans_eval(path="Si.kcw-ham_proj.out")
         """
         # output_ase is if we already inspected the output file (e.g. aiida)
 
-        logger.warning(
-            "Reading kpoints and eigenvalues from kcw.x output file is not fully implemented. "
-            "For now, this is primarily supported for AiiDA workflows."
-        )
-        
-        try:
-            output = io.read(path) if not output_ase else output_ase
-        except Exception as e:
-            raise RuntimeError(f"Failed to read Koopmans output file: {e}")
+        if output_ase:
+            output = output_ase
+        else:
+            import tempfile
+            import shutil
+
+            path = Path(path)
+            # ase_koopmans.io dispatches on file extension; if the file does not
+            # already carry a recognised .kho suffix, copy it to a temporary file
+            # with that extension so the format is detected correctly.
+            if path.suffix != '.kho':
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = Path(tmpdir) / (path.stem + '.kho')
+                    shutil.copy2(path, tmp_path)
+                    try:
+                        output = io.read(tmp_path)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Failed to read Koopmans output file '{path}' "
+                            f"(tried via temporary .kho copy, "
+                            f"{type(e).__name__}: {e!r})."
+                        ) from e
+            else:
+                try:
+                    output = io.read(path)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to read Koopmans output file '{path}' "
+                        f"({type(e).__name__}: {e!r})."
+                    ) from e
             
         if results not in output.calc.results.keys():
             raise ValueError(f"the requested results {results} are not in the output calc results. Available results are: {list(output.calc.results.keys())}")
@@ -468,10 +727,10 @@ class KcwQpDatabaseGenerator:
     
     def set_kpoints_from_pwinput(self, pwinput_path:str):
         """
-        Extract and store k-points from a Quantum ESPRESSO pw.x input file.
+        Extract and store k-points from the pw.x input file used for the KCW calculation.
         
         This method uses the extract_kpoints utility to read k-points from
-        a pw.x input file (e.g., pwnscf.in) and stores them in the 
+        the pw.x input file of the KCW run (e.g., pwnscf.in) and stores them in the 
         kpoints_grid_kcw attribute along with the k-point type.
 
         NB: the k-points should be in crystal coordinates.
@@ -479,7 +738,7 @@ class KcwQpDatabaseGenerator:
         Parameters
         ----------
         pwinput_path : str
-            Path to the pw.x input file
+            Path to the pw.x input file used for the KCW calculation
             
         Attributes set
         --------------
@@ -763,9 +1022,17 @@ class KcwQpDatabaseGenerator:
         self.table = QP_table
         
         QP_E = [[E,0] for E in reshaped_eval] # [[E.real,E.imag]]
-        PARS = np.ma.array(
-            np.array([np.shape(eigenvalues)[1],np.shape(eigenvalues)[0],np.shape(eigenvalues)[0]*np.shape(eigenvalues)[1],26,-1,-1]),
-            mask = [False, False, False, False,  True,  True])
+        # PARS: [n_bands, n_kpts, n_states, n_descriptors, 0, 0]
+        # The last two entries are unused; use 0.0 (not masked) to avoid
+        # netCDF fill-value overflow when Yambo reads them as integers.
+        PARS = np.array([
+            float(np.shape(eigenvalues)[1]),  # number of bands
+            float(np.shape(eigenvalues)[0]),  # number of k-points
+            float(np.shape(eigenvalues)[0] * np.shape(eigenvalues)[1]),  # total states
+            26.0,   # number of descriptors
+            0.0,    # unused
+            0.0,    # unused
+        ], dtype=np.float32)
 
         self.QP_E = QP_E
 
@@ -779,6 +1046,22 @@ class KcwQpDatabaseGenerator:
         "QP_table": QP_table,
         "PARS":PARS,
         }
+
+        # Inject the SERIAL_NUMBER from the SAVE directory so Yambo can
+        # match the ndb.QP to its own databases (ndb.gops / ndb.kindx).
+        save_dir = getattr(self, 'save_dir', None)
+        if save_dir is not None:
+            for candidate in ('ndb.gops', 'ndb.kindx'):
+                candidate_path = save_dir / candidate
+                if candidate_path.exists():
+                    try:
+                        with nc.Dataset(str(candidate_path)) as _db:
+                            if 'SERIAL_NUMBER' in _db.variables:
+                                self.mapped_vars['SERIAL_NUMBER'] = \
+                                    np.array(_db.variables['SERIAL_NUMBER'][:], dtype=np.float32)
+                        break
+                    except Exception:
+                        pass
 
         # This mapping is done onto template.QPs. You should always use them!!!
         # TODO: generalize this, to read from whatever template.QP you want.
