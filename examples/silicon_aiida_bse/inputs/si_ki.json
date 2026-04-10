@@ -1,0 +1,71 @@
+{
+    "workflow": {
+        "task": "singlepoint",
+        "functional": "ki",
+        "base_functional": "lda",
+        "method": "dfpt",
+        "mp_correction": false,
+        "init_orbitals": "mlwfs",
+        "calculate_alpha": true,
+        "pseudo_library": "PseudoDojo/0.4/LDA/SR/standard/upf",
+        "dfpt_coarse_grid": [2, 2, 2]
+    },
+    "engine": {
+        "from_scratch": true
+    },
+    "atoms": {
+        "cell_parameters": {
+            "vectors": [
+                [-2.6943057563, 0.0, 2.6943057563],
+                [ 0.0, 2.6943057563, 2.6943057563],
+                [-2.6943057563, 2.6943057563, 0.0]
+            ],
+            "units": "angstrom",
+            "periodic": true
+        },
+        "atomic_positions": {
+            "units": "angstrom",
+            "positions": [
+                ["Si",  0.0000000000,  0.0000000000,  0.0000000000],
+                ["Si", -1.3471528782,  1.3471528782,  1.3471528782]
+            ]
+        }
+    },
+    "kpoints": {
+        "grid": [2, 2, 2],
+        "offset": [0, 0, 0],
+        "path": "GXKG"
+    },
+    "calculator_parameters": {
+        "ecutwfc": 60,
+        "pw": {
+            "system": {
+                "nbnd": 20
+            }
+        },
+        "w90": {
+            "bands_plot": false,
+            "projections": [
+                [{"fsite": [0.00, 0.00, 0.00], "ang_mtm": "sp3"}],
+                [{"fsite": [0.25, 0.25, 0.25], "ang_mtm": "sp3"}]
+            ],
+            "dis_froz_max": 10.6,
+            "dis_win_max": 16.9
+        },
+        "kcw": {
+            "ham": {
+                "on_site_only": true,
+                "h_diag_scheme": "uniq",
+                "do_bands": false
+            }
+        },
+        "ui": {
+            "smooth_int_factor": 4
+        }
+    },
+    "plotting": {
+        "Emin": -15,
+        "Emax": 10,
+        "degauss": 0.2
+    }
+}
