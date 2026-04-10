@@ -17,6 +17,7 @@ requiring GW ones.
 from typing import Union, Optional, Tuple, Dict, Any
 from pathlib import Path
 import warnings
+import logging
 
 import netCDF4 as nc
 from ase.units import Ha
@@ -24,8 +25,20 @@ from ase_koopmans import io
 import xarray
 import itertools
 import numpy as np
-from yambopy import YamboSaveDB
+from yambopy import YamboElectronsDB
 from yambopy.lattice import car_red, red_car
+
+# Set up module logger
+logger = logging.getLogger(__name__)
+
+# Constants for k-point matching and database dimensions
+DEFAULT_KPOINT_TOLERANCE = 1e-4
+QP_DATABASE_DIMENSIONS = {
+    'QP_EO_DIM': 'D_0000000064',
+    'QP_E_DIM': 'D_0000000077',
+    'KPTS_DIM_X': 'D_0000000008',
+    'KPTS_DIM_Y': 'D_0000000007',
+}
 
 class KcwQpDatabaseGenerator:
     """
@@ -45,7 +58,7 @@ class KcwQpDatabaseGenerator:
     ----------
     ns_db1 : xarray.Dataset
         Yambo ns.db1 database containing KS eigenvalues and k-points
-    yambopy_ns_db1 : YamboSaveDB
+    yambopy_ns_db1 : YamboElectronsDB
         YamboPy interface to ns.db1
     template_QP_path : Path
         Path to template QP database
@@ -109,7 +122,16 @@ class KcwQpDatabaseGenerator:
             Path to template QP database file. If not provided, uses bundled template.
             The template defines the structure and metadata for the output ndb.QP file.
         spin : bool, default=False
-            Whether to use spin-polarized template. If yoo provide your own template, this is ignored.
+            Whether to use spin-polarized template. If you provide your own template, this is ignored.
+        kpoints_units_kcw : str, default='reduced'
+            Units for k-points from KCW calculation ('reduced' or 'crystal')
+            
+        Raises
+        ------
+        FileNotFoundError
+            If ns_db1 or template_QP_path file does not exist
+        RuntimeError
+            If ns.db1 file cannot be loaded
             
         Notes
         -----
@@ -121,17 +143,271 @@ class KcwQpDatabaseGenerator:
             print(f"Reading ns.db1 from: {ns_db1}")
             self.ns_db1 = xarray.open_dataset(ns_db1, engine='netcdf4')
             ns_dir = str(ns_db1).replace('/ns.db1', '')
-            self.yambopy_ns_db1 = YamboSaveDB.from_db_file(ns_dir)
+            self.yambopy_ns_db1 = YamboElectronsDB.from_db_file(folder=ns_dir, Expand=True)
+            self.save_dir = Path(ns_db1).parent
             
         if template_QP_path:
-            print(f"Using QP template: {template_QP_path}")
-            self.template_QP_path = Path(template_QP_path)
+            template_path = Path(template_QP_path)
+            if not template_path.exists():
+                raise FileNotFoundError(f"Template QP file not found: {template_QP_path}")
+            logger.info(f"Using QP template: {template_QP_path}")
+            self.template_QP_path = template_path
         else:
             self.template_QP_path = self.get_templateQP_filepath(spin=spin)
+            logger.info(f"Using bundled template: {self.template_QP_path}")
         
         self.QP_template = None
-        self.kpoints_units_kcw = kpoints_units_kcw 
+        self.kpoints_units_kcw = kpoints_units_kcw
+        
+        # Initialize attributes that will be set later
+        self.eigenvalues_KI = None
+        self.eigenvalues_KS = None
+        self.kpoints_grid_kcw = None
+        self.kpoints_type = None
+
+        if ns_db1 and self.template_QP_path:
+            self.check_version_compatibility(auto_select=True)
             
+    def check_version_compatibility(self, auto_select: bool = True) -> None:
+        """
+        Check that the Yambo version used to generate the SAVE directory is
+        compatible with the template ndb.QP file.
+
+        Version information is read from `ndb.gops` or `ndb.kindx` (whichever
+        is found first) in the same directory as ns.db1, and compared against
+        the `HEAD_VERSION` variable in the template QP file.
+
+        When a mismatch is detected the bundled templates are scanned and the
+        closest one (by version tuple proximity) is reported.  If
+        ``auto_select=True`` (the default) and a bundled template is closer
+        than the current one, ``self.template_QP_path`` is updated
+        automatically.
+
+        Parameters
+        ----------
+        auto_select : bool, default=True
+            If True and a closer bundled template is found, switch to it
+            automatically and emit a warning.  If False, only warn without
+            switching.
+
+        Notes
+        -----
+        `ns.db1` itself does not store a reliable version number (GPL_REVISION
+        is zero in all known Yambo releases).  The sibling files `ndb.gops` and
+        `ndb.kindx` do carry `HEAD_VERSION` / `HEAD_REVISION` and are always
+        present in a valid SAVE directory.
+        """
+        save_dir = getattr(self, 'save_dir', None)
+        if save_dir is None:
+            logger.debug("save_dir not set; skipping version check.")
+            return
+
+        # --- read Yambo version from SAVE directory ---
+        yambo_version = None
+        yambo_revision = None
+        for candidate in ('ndb.gops', 'ndb.kindx'):
+            candidate_path = save_dir / candidate
+            if candidate_path.exists():
+                try:
+                    with nc.Dataset(str(candidate_path)) as db:
+                        if 'HEAD_VERSION' in db.variables:
+                            yambo_version = list(db.variables['HEAD_VERSION'][:])
+                        if 'HEAD_REVISION' in db.variables:
+                            yambo_revision = int(db.variables['HEAD_REVISION'][:][0])
+                    break
+                except Exception:
+                    pass
+
+        if yambo_version is None:
+            logger.debug(
+                "Could not determine Yambo version from SAVE directory "
+                f"(checked {save_dir}/ndb.gops and ndb.kindx)."
+            )
+            return
+
+        # --- read version from current template ---
+        tpl_version = None
+        tpl_revision = None
+        try:
+            with nc.Dataset(str(self.template_QP_path)) as db:
+                if 'HEAD_VERSION' in db.variables:
+                    tpl_version = list(db.variables['HEAD_VERSION'][:])
+                if 'HEAD_REVISION' in db.variables:
+                    tpl_revision = int(db.variables['HEAD_REVISION'][:][0])
+        except Exception:
+            pass
+
+        if tpl_version is None:
+            logger.debug("Could not read HEAD_VERSION from template QP file.")
+            return
+
+        yambo_ver_str = '.'.join(str(int(x)) for x in yambo_version)
+        tpl_ver_str   = '.'.join(str(int(x)) for x in tpl_version)
+
+        if yambo_version == tpl_version:
+            logger.info(
+                f"Version check passed: SAVE and template QP both target "
+                f"Yambo {yambo_ver_str} (rev {yambo_revision})."
+            )
+            return
+
+        # --- mismatch: look for a better bundled template ---
+        spin = getattr(self, '_spin', False)  # stored by __init__ if needed
+        best = self.find_best_template(yambo_version, spin=spin)
+        best_ver_str = '.'.join(str(int(x)) for x in best['version'])
+
+        def _distance(v_a, v_b):
+            """Weighted distance: major*100 + minor*10 + patch."""
+            weights = (100, 10, 1)
+            return sum(w * abs(int(a) - int(b)) for w, a, b in zip(weights, v_a, v_b))
+
+        current_dist = _distance(yambo_version, tpl_version)
+        best_dist    = _distance(yambo_version, best['version'])
+
+        if int(yambo_version[0]) != int(tpl_version[0]):
+            severity = "major version mismatch"
+        else:
+            severity = "minor version mismatch"
+
+        if best_dist < current_dist:
+            msg = (
+                f"Yambo {severity}: SAVE directory was generated with "
+                f"Yambo {yambo_ver_str} (rev {yambo_revision}), "
+                f"current template targets {tpl_ver_str} (rev {tpl_revision}). "
+                f"A closer bundled template was found: '{best['name']}' "
+                f"(Yambo {best_ver_str}, rev {best['revision']}). "
+            )
+            if auto_select:
+                self.template_QP_path = best['path']
+                msg += "Switched to it automatically."
+            else:
+                msg += (
+                    f"Consider using it via: "
+                    f"KcwQpDatabaseGenerator.get_templateQP_filepath() "
+                    f"or passing template_QP_path='{best['path']}'."
+                )
+        else:
+            msg = (
+                f"Yambo {severity}: SAVE directory was generated with "
+                f"Yambo {yambo_ver_str} (rev {yambo_revision}), "
+                f"template targets {tpl_ver_str} (rev {tpl_revision}). "
+                f"No closer bundled template found (best available: "
+                f"'{best['name']}' at {best_ver_str}). "
+                "Consider providing a custom template_QP_path."
+            )
+
+        warnings.warn(msg, UserWarning, stacklevel=3)
+
+    @classmethod
+    def list_bundled_templates(cls) -> list:
+        """
+        Return metadata for every bundled ndb.QP template file.
+
+        Returns
+        -------
+        list of dict
+            Each dict has keys:
+
+            * ``'name'`` – filename (str)
+            * ``'path'`` – :class:`pathlib.Path` to the file
+            * ``'version'`` – ``[major, minor, patch]`` as floats, or ``None``
+            * ``'revision'`` – int revision number, or ``None``
+            * ``'spin'`` – ``True`` if SPIN_VARS[0] > 1
+
+        Examples
+        --------
+        >>> for t in KcwQpDatabaseGenerator.list_bundled_templates():
+        ...     print(t['name'], t['version'], t['spin'])
+        template.QP [5.0, 2.0, 1.0] False
+        template_v510.QP [5.0, 1.0, 2.0] False
+        template_v530.QP [5.0, 3.0, 0.0] False
+        template_v530_spin.QP [5.0, 3.0, 0.0] True
+        """
+        from importlib_resources import files
+        from . import templates as _templates_pkg
+
+        tpl_dir = files(_templates_pkg)
+        results = []
+        for name in sorted(p.name for p in tpl_dir.iterdir()):
+            if not name.endswith('.QP'):
+                continue
+            path = tpl_dir / name
+            entry = {'name': name, 'path': path, 'version': None,
+                     'revision': None, 'spin': False}
+            try:
+                with nc.Dataset(str(path)) as db:
+                    if 'HEAD_VERSION' in db.variables:
+                        entry['version'] = list(db.variables['HEAD_VERSION'][:])
+                    if 'HEAD_REVISION' in db.variables:
+                        entry['revision'] = int(db.variables['HEAD_REVISION'][:][0])
+                    if 'SPIN_VARS' in db.variables:
+                        entry['spin'] = int(db.variables['SPIN_VARS'][:][0]) > 1
+            except Exception:
+                pass
+            results.append(entry)
+        return results
+
+    @classmethod
+    def find_best_template(cls, yambo_version: list, spin: bool = False) -> dict:
+        """
+        Find the bundled template whose Yambo version is closest to
+        ``yambo_version``.
+
+        The search is restricted to templates whose spin character matches the
+        ``spin`` argument.  Closeness is defined as the sum of squared
+        differences across ``[major, minor, patch]``; in case of a tie the
+        template with the higher revision number wins.
+
+        Parameters
+        ----------
+        yambo_version : list
+            Target version as ``[major, minor, patch]`` (floats or ints).
+        spin : bool, default=False
+            If True, consider only spin-polarised templates; otherwise only
+            non-spin templates.
+
+        Returns
+        -------
+        dict
+            The metadata dict (as returned by :meth:`list_bundled_templates`)
+            for the best-matching template.
+
+        Raises
+        ------
+        RuntimeError
+            If no bundled template with known version information is found.
+
+        Examples
+        --------
+        >>> best = KcwQpDatabaseGenerator.find_best_template([5, 1, 0])
+        >>> print(best['name'], best['version'])
+        template_v510.QP [5.0, 1.0, 2.0]
+        """
+        def _distance(v_a, v_b):
+            return sum((int(a) - int(b)) ** 2 for a, b in zip(v_a, v_b))
+
+        candidates = [
+            t for t in cls.list_bundled_templates()
+            if t['version'] is not None and t['spin'] == spin
+        ]
+        if not candidates:
+            raise RuntimeError(
+                "No bundled templates with version information found "
+                f"(spin={spin})."
+            )
+
+        def _distance(v_a, v_b):
+            """Weighted distance: major*100 + minor*10 + patch, so minor version
+            matches are always preferred over patch proximity to a different minor."""
+            weights = (100, 10, 1)
+            return sum(w * abs(int(a) - int(b)) for w, a, b in zip(weights, v_a, v_b))
+
+        candidates.sort(
+            key=lambda t: (_distance(yambo_version, t['version']),
+                           -(t['revision'] or 0))
+        )
+        return candidates[0]
+
     @classmethod
     def get_templateQP_filepath(cls, spin: bool = False) -> Path:
         """
@@ -171,6 +447,121 @@ class KcwQpDatabaseGenerator:
 
         from . import templates
         return files(templates) / f'template_v530{"_spin" if spin else ""}.QP'
+
+    def validate_inputs(self) -> Dict[str, bool]:
+        """
+        Validate that all required inputs are set.
+        
+        Returns
+        -------
+        dict
+            Dictionary mapping input names to their validation status (True if set)
+            
+        Examples
+        --------
+        >>> converter = KcwQpDatabaseGenerator()
+        >>> converter.validate_inputs()
+        {
+            'ns_db1': False,
+            'eigenvalues_KI': False,
+            'eigenvalues_KS': False,
+            'kpoints_grid_kcw': False
+        }
+        
+        >>> converter = KcwQpDatabaseGenerator(ns_db1="SAVE/ns.db1")
+        >>> converter.set_koopmans_eval(path="kc.kho")
+        >>> converter.set_kpoints_from_pwinput("nscf.in")
+        >>> converter.validate_inputs()
+        {
+            'ns_db1': True,
+            'eigenvalues_KI': True,
+            'eigenvalues_KS': True,
+            'kpoints_grid_kcw': True
+        }
+        """
+        return {
+            'ns_db1': self.ns_db1 is not None,
+            'eigenvalues_KI': self.eigenvalues_KI is not None,
+            'eigenvalues_KS': self.eigenvalues_KS is not None,
+            'kpoints_grid_kcw': self.kpoints_grid_kcw is not None,
+        }
+    
+    def validate_or_raise(self) -> None:
+        """
+        Validate all required inputs and raise informative error if any are missing.
+        
+        Raises
+        ------
+        ValueError
+            If any required inputs are missing
+            
+        Examples
+        --------
+        >>> converter = KcwQpDatabaseGenerator()
+        >>> converter.validate_or_raise()
+        ValueError: Missing required inputs: ns_db1, eigenvalues_KI, eigenvalues_KS, kpoints_grid_kcw
+        """
+        validation = self.validate_inputs()
+        missing = [k for k, v in validation.items() if not v]
+        if missing:
+            raise ValueError(
+                f"Missing required inputs: {', '.join(missing)}. "
+                f"Please set these before calling generate_mappings()."
+            )
+    
+    def summary(self) -> str:
+        """
+        Generate a summary of the current converter state.
+        
+        Returns
+        -------
+        str
+            Multi-line summary string showing loaded data and processing status
+            
+        Examples
+        --------
+        >>> converter = KcwQpDatabaseGenerator(ns_db1="SAVE/ns.db1")
+        >>> print(converter.summary())
+        KcwQpDatabaseGenerator Summary
+        ========================================
+        ns.db1 loaded: True
+          K-points in ns.db1: 64
+          Bands in ns.db1: N/A
+        Koopmans eigenvalues: Not loaded
+        KCW k-points: Not loaded
+        Mappings generated: No
+        """
+        lines = [
+            "KcwQpDatabaseGenerator Summary",
+            "=" * 40,
+            f"ns.db1 loaded: {self.ns_db1 is not None}",
+        ]
+        
+        if self.ns_db1 is not None and self.yambopy_ns_db1 is not None:
+            lines.append(f"  K-points in ns.db1: {self.yambopy_ns_db1.nkpoints}")
+            if hasattr(self, 'ns_db1_evalues') and self.ns_db1_evalues is not None:
+                lines.append(f"  Bands in ns.db1: {self.ns_db1_evalues.shape[1]}")
+            else:
+                lines.append(f"  Bands in ns.db1: N/A")
+        
+        if self.eigenvalues_KI is not None:
+            lines.append(f"Koopmans eigenvalues: {self.eigenvalues_KI.shape}")
+        else:
+            lines.append("Koopmans eigenvalues: Not loaded")
+        
+        if self.kpoints_grid_kcw is not None:
+            lines.append(f"KCW k-points: {self.kpoints_grid_kcw.shape[0]} ({self.kpoints_type})")
+        else:
+            lines.append("KCW k-points: Not loaded")
+        
+        if hasattr(self, 'mapped_vars') and self.mapped_vars is not None:
+            lines.append("Mappings generated: Yes")
+            lines.append(f"  Output bands: {self.mapped_vars['QP_QP_@_state_1_b_range']}")
+            lines.append(f"  Output k-points: {self.mapped_vars['QP_QP_@_state_1_K_range']}")
+        else:
+            lines.append("Mappings generated: No")
+        
+        return "\n".join(lines)
      
     def produce_kpoints_for_interpolation(self, filename: Optional[str] = None, coordinates: Optional[str] = "crystal", full_BZ: Optional[str] = False) -> None:
         """
@@ -215,7 +606,7 @@ class KcwQpDatabaseGenerator:
         ns = self.ns_db1
 
         if full_BZ:
-            kpoints = self.yambopy_ns_db1.expand_kpts()[0]
+            kpoints = self.yambopy_ns_db1.expand_kpoints()[0]
         else:
             kpoints = self.yambopy_ns_db1.car_kpoints
 
@@ -276,9 +667,10 @@ class KcwQpDatabaseGenerator:
             
         Notes
         -----
-        Currently implemented primarily for AiiDA workflows. Direct file reading
-        from kcw.x output files is not yet fully supported.
-        
+        If the file does not have a `.kho` extension, a temporary copy is created
+        with that extension so that `ase_koopmans.io` can dispatch to the correct
+        format reader automatically.
+
         The eigenvalues are stored as flattened arrays and will be reshaped
         during the generate_mappings() step based on the k-point grid.
         
@@ -289,21 +681,42 @@ class KcwQpDatabaseGenerator:
         >>> print(converter.eigenvalues_KI.shape)  # Flattened
         (12800,)
         
-        See Also
-        --------
-        set_kpoints_from_pwinput : Load corresponding k-point grid
-        generate_mappings : Reshape and map eigenvalues to Yambo grid
-        from_aiida : Alternative initialization from AiiDA calculations
-        
-        Warnings
-        --------
-        This method prints a warning about limited file format support.
+        >>> # Also works with non-.kho extensions (e.g. kcw.x stdout):
+        >>> converter.set_koopmans_eval(path="Si.kcw-ham_proj.out")
         """
         # output_ase is if we already inspected the output file (e.g. aiida)
 
-        print("Warning: still, we need to implement the reading of the kpoints and eigenvalues_pki from the kcw.x output file. For now, it is only implemented for AiiDA.")
-        
-        output = io.read(path) if not output_ase else output_ase
+        if output_ase:
+            output = output_ase
+        else:
+            import tempfile
+            import shutil
+
+            path = Path(path)
+            # ase_koopmans.io dispatches on file extension; if the file does not
+            # already carry a recognised .kho suffix, copy it to a temporary file
+            # with that extension so the format is detected correctly.
+            if path.suffix != '.kho':
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = Path(tmpdir) / (path.stem + '.kho')
+                    shutil.copy2(path, tmp_path)
+                    try:
+                        output = io.read(tmp_path)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Failed to read Koopmans output file '{path}' "
+                            f"(tried via temporary .kho copy, "
+                            f"{type(e).__name__}: {e!r})."
+                        ) from e
+            else:
+                try:
+                    output = io.read(path)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to read Koopmans output file '{path}' "
+                        f"({type(e).__name__}: {e!r})."
+                    ) from e
+            
         if results not in output.calc.results.keys():
             raise ValueError(f"the requested results {results} are not in the output calc results. Available results are: {list(output.calc.results.keys())}")
         
@@ -314,10 +727,10 @@ class KcwQpDatabaseGenerator:
     
     def set_kpoints_from_pwinput(self, pwinput_path:str):
         """
-        Extract and store k-points from a Quantum ESPRESSO pw.x input file.
+        Extract and store k-points from the pw.x input file used for the KCW calculation.
         
         This method uses the extract_kpoints utility to read k-points from
-        a pw.x input file (e.g., pwnscf.in) and stores them in the 
+        the pw.x input file of the KCW run (e.g., pwnscf.in) and stores them in the 
         kpoints_grid_kcw attribute along with the k-point type.
 
         NB: the k-points should be in crystal coordinates.
@@ -325,7 +738,7 @@ class KcwQpDatabaseGenerator:
         Parameters
         ----------
         pwinput_path : str
-            Path to the pw.x input file
+            Path to the pw.x input file used for the KCW calculation
             
         Attributes set
         --------------
@@ -336,17 +749,23 @@ class KcwQpDatabaseGenerator:
         """
         from .extract_kpoints import extract_kpoints_from_pwin
         
-        kpoints, kpoints_type = extract_kpoints_from_pwin(pwinput_path)
+        if not Path(pwinput_path).exists():
+            raise FileNotFoundError(f"PW input file not found: {pwinput_path}")
+        
+        try:
+            kpoints, kpoints_type = extract_kpoints_from_pwin(pwinput_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to extract k-points from {pwinput_path}: {e}")
         
         self.kpoints_grid_kcw = kpoints
         self.kpoints_type = kpoints_type
         
-        print(f"Loaded {len(kpoints)} k-points of type '{kpoints_type}' from {pwinput_path}")
-        print(f"K-points shape: {kpoints.shape}")
+        logger.info(f"Loaded {len(kpoints)} k-points of type '{kpoints_type}' from {pwinput_path}")
+        logger.debug(f"K-points shape: {kpoints.shape}")
         
         return kpoints, kpoints_type
     
-    def generate_mappings(self, time_rev:bool=True, brute_force:bool=True) -> None:
+    def generate_mappings(self, time_rev:bool=True, brute_force:bool=True, QP_E_consistent_QP_Eo=False) -> None:
         """
         Generate k-point and eigenvalue mappings between KCW and Yambo grids.
         
@@ -358,9 +777,11 @@ class KcwQpDatabaseGenerator:
         4. **Map k-points**: Match KCW k-points to Yambo k-point grid
         5. **Compute QP corrections**: Calculate ΔE = E_KI + (E_KS^KCW - E_KS^Yambo)
         
-        The QP correction formula ensures that when Yambo applies the correction:
+        The QP correction formula ensures that when Yambo applies the correction in the BSE:
             E_QP = E_KS^Yambo + ΔE
-        it yields the Koopmans eigenvalues E_KI.
+        it yields the Koopmans eigenvalues E_KI. E_KS^Yambo is the one from the ns.db1.
+        NB: however, setting QP_E_consistent_QP_Eo=True will instead compute E_QP = E_KI, so 
+        that QP_E - QP_Eo = E_KI - E_KS^(pw done within kcw). But this is not the standard way Yambo works. Use with care.
         
         Parameters
         ----------
@@ -435,25 +856,33 @@ class KcwQpDatabaseGenerator:
         --------
         This method modifies eigenvalues in place. If KCW has more bands than
         ns.db1, only the first n_bands will be included in the QP database.
+
+        NOTE: new_KI, new_KS are in eV. We convert to Ha only before writing in the db.
         """
+        
+        # Validate inputs before proceeding
+        self.validate_or_raise()
+        
+        logger.info("Starting k-point and eigenvalue mapping generation...")
         
         # NB: it is fundamental that the KS eigenvalues in the ns.db1 are the same as the ones in the new DB. 
         # Otherwise, the mapping will not work and yambo will interpolate the wrong eigenvalues.
 
         ns = self.ns_db1
-        if not hasattr(self, 'eigenvalues_KS'):
+        if not hasattr(self, 'eigenvalues_KS') or self.eigenvalues_KS is None:
             self.eigenvalues_KS = ns.variables["EIGENVALUES"].values[0] # not exactly, but we can map.
+            logger.info("Using KS eigenvalues from ns.db1")
         else:
-            print("using the eigenvalues already stored.")
+            logger.info("Using KS eigenvalues already stored from KCW calculation")
         
         # Handle spin dimension in ns.db1
         # ns_db1_evalues shape can be (n_spin, n_kpoints, n_bands) or (n_kpoints, n_bands)
         ns_db1_evalues_raw = ns.variables["EIGENVALUES"].values
         if len(ns_db1_evalues_raw.shape) == 3:
             # Has spin dimension, take first spin component
-            print(f"ns.db1 has spin dimension: {ns_db1_evalues_raw.shape}")
+            logger.info(f"ns.db1 has spin dimension: {ns_db1_evalues_raw.shape}")
             self.ns_db1_evalues = ns_db1_evalues_raw[0]  # Shape: (n_kpoints, n_bands)
-            print(f"Using first spin component, shape: {self.ns_db1_evalues.shape}")
+            logger.info(f"Using first spin component, shape: {self.ns_db1_evalues.shape}")
         else:
             self.ns_db1_evalues = ns_db1_evalues_raw
 
@@ -462,11 +891,11 @@ class KcwQpDatabaseGenerator:
         if len(self.eigenvalues_KS.shape) == 2 and self.eigenvalues_KS.shape[0] == 1:
             n_kpoints = self.kpoints_grid_kcw.shape[0]
             n_bands = self.eigenvalues_KS.shape[1] // n_kpoints
-            print(f"Reshaping flattened eigenvalues: total_size={self.eigenvalues_KS.shape[1]} -> ({n_kpoints}, {n_bands})")
+            logger.info(f"Reshaping flattened eigenvalues: total_size={self.eigenvalues_KS.shape[1]} -> ({n_kpoints}, {n_bands})")
             self.eigenvalues_KS = self.eigenvalues_KS.reshape((n_kpoints, n_bands))
             self.eigenvalues_KI = self.eigenvalues_KI.reshape((n_kpoints, n_bands))
-            print(f"Reshaped eigenvalues_KS: {self.eigenvalues_KS.shape}")
-            print(f"Reshaped eigenvalues_KI: {self.eigenvalues_KI.shape}")
+            logger.debug(f"Reshaped eigenvalues_KS: {self.eigenvalues_KS.shape}")
+            logger.debug(f"Reshaped eigenvalues_KI: {self.eigenvalues_KI.shape}")
 
         ########################## Making yambo-KS (we will refer as yKS) compatible with kcw-KS (we will refer as kKS)
         ######## SKIP : (1) Mapping of the kpoints from the full grid to the kpoints in the koopmans KS/KI.
@@ -476,20 +905,20 @@ class KcwQpDatabaseGenerator:
         # we expand the kpoints to the full grid, so we have the mapping
         # between the kpoints in the ns.db1 and the kpoints in the koopmans KS/KI.
         
-        self.yambopy_ns_db1.expand_kpts()
+        self.yambopy_ns_db1.expand_kpoints()
         
         # Determine the number of bands to use: minimum between KCW and ns.db1
         n_bands_ns_db1 = self.ns_db1_evalues.shape[1]
         n_bands_kcw = self.eigenvalues_KS.shape[1]
         n_bands = min(n_bands_ns_db1, n_bands_kcw)
         
-        print(f"ns.db1 has {n_bands_ns_db1} bands")
-        print(f"KCW has {n_bands_kcw} bands")
-        print(f"Using {n_bands} bands for mapping")
+        logger.info(f"ns.db1 has {n_bands_ns_db1} bands")
+        logger.info(f"KCW has {n_bands_kcw} bands")
+        logger.info(f"Using {n_bands} bands for mapping")
         
         if n_bands_kcw > n_bands_ns_db1:
-            print(f"WARNING: KCW has more bands ({n_bands_kcw}) than ns.db1 ({n_bands_ns_db1})")
-            print(f"Only the first {n_bands} bands will be mapped to the QP database")
+            logger.warning(f"KCW has more bands ({n_bands_kcw}) than ns.db1 ({n_bands_ns_db1})")
+            logger.warning(f"Only the first {n_bands} bands will be mapped to the QP database")
         
         # Determine number of kpoints from yambopy_ns_db1.eigenvalues
         # Shape can be (n_spin, n_kpoints, n_bands) or (n_kpoints, n_bands)
@@ -498,51 +927,69 @@ class KcwQpDatabaseGenerator:
         else:
             n_kpoints_yambo = self.yambopy_ns_db1.eigenvalues.shape[0]
         
-        print(f"Yambo ns.db1 has {n_kpoints_yambo} k-points")
+        logger.info(f"Yambo ns.db1 has {n_kpoints_yambo} k-points")
         
         #new_KS = np.zeros((n_kpoints_yambo, n_bands))
         #new_KI = np.zeros((n_kpoints_yambo, n_bands))
         
-        # Use only the bands that are available in both databases
-        eigenvalues = self.eigenvalues_KI[:n_kpoints_yambo,:n_bands].copy()
-        eigenvalues_KS = self.eigenvalues_KS[:n_kpoints_yambo,:n_bands].copy()
-
-        expanded_kpoints, expanded_indexes, _ = self.yambopy_ns_db1.expand_kpts() # this gives cartesian coordinates
+        # Expand k-points to full BZ (cartesian), then convert to match kpoints_type
+        expanded_kpoints, expanded_indexes, _ = self.yambopy_ns_db1.expand_kpoints() # this gives cartesian coordinates
+        expanded_kpoints_car = expanded_kpoints.copy()  # keep cartesian copy for QP_kpts
         if self.kpoints_type in ['reduced','crystal']:
             expanded_kpoints = car_red(expanded_kpoints,self.yambopy_ns_db1.rlat)
 
+        # Allocate output arrays with full-BZ size
+        eigenvalues = np.zeros((n_kpoints_yambo, n_bands))
+        eigenvalues_KS = np.zeros((n_kpoints_yambo, n_bands))
+
+        logger.info("Mapping k-points between KCW and Yambo grids...")
+        matched_kpoints = 0
         for k in range(n_kpoints_yambo):
-            where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw - self.yambopy_ns_db1.red_kpoints[k])<1e-4, axis=1))[0]
+            # expanded_kpoints[k] is the k-th full-BZ kpoint (already in the right coordinate system)
+            where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw - expanded_kpoints[k])<DEFAULT_KPOINT_TOLERANCE, axis=1))[0]
             if len(where_first) == 0:
-                print(f"Warning: kpoint {k} not found in the kpoints grid of the Koopmans KS/KI. Expanding the kpoints of ns.db1 and searching again.")
-                where_this_kpoint = np.where(expanded_indexes == k)[0]
+                logger.debug(f"K-point {k} not found directly, trying expanded grid...")
+                # find all full-BZ kpoints sharing the same IBZ kpoint as k
+                ibz_idx = expanded_indexes[k]
+                where_this_kpoint = np.where(expanded_indexes == ibz_idx)[0]
                 # we then search for the kpoint in the expanded kpoints, but we still use the index k.:
                 for kpoint in expanded_kpoints[where_this_kpoint]:
-                    where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw - kpoint)<1e-4, axis=1))[0]
+                    where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw - kpoint)<DEFAULT_KPOINT_TOLERANCE, axis=1))[0]
                     if len(where_first) > 0:
                         where = where_first[0]
-                        print("Found by expanding the kpoints.")
+                        logger.debug(f"K-point {k} found by expanding the grid")
                         break
                     if time_rev:
-                        where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw + kpoint)<1e-4, axis=1))[0]
+                        where_first = np.where(np.all(np.abs(self.kpoints_grid_kcw + kpoint)<DEFAULT_KPOINT_TOLERANCE, axis=1))[0]
                         if len(where_first) > 0:
                             where = where_first[0]
-                            print("Found by expanding kpoints and using time-reversal symmetry.")
+                            logger.debug(f"K-point {k} found using time-reversal symmetry")
                             break
                     if brute_force:
-                        where_first = np.where(np.all(np.abs(np.abs(self.kpoints_grid_kcw) - np.abs(kpoint))<1e-4, axis=1))[0]
+                        where_first = np.where(np.all(np.abs(np.abs(self.kpoints_grid_kcw) - np.abs(kpoint))<DEFAULT_KPOINT_TOLERANCE, axis=1))[0]
                         if len(where_first) > 0:
                             where = where_first[0]
-                            print("Found by expanding kpoints and using brute-force matching (i.e. matching the abs value of each single k-coordinates).")
+                            logger.debug(f"K-point {k} found using brute-force matching")
                             break
             else:
-                print(f"Found kpoint {k} directly in the KCW kpoints grid.")
+                logger.debug(f"K-point {k} found directly in the KCW kpoints grid")
                 where = where_first[0]
             #new_KS[k,:] = self.eigenvalues_KS[where,:]
             #new_KI[k,:] = self.eigenvalues_KI[where,:]
-
-            eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands] + (self.eigenvalues_KS[where,:n_bands] - Ha*self.ns_db1_evalues[k,:n_bands])
-            eigenvalues_KS[k,:] = self.eigenvalues_KS[where,:n_bands]
+            if QP_E_consistent_QP_Eo:
+                # we want E_QP = E_KI, so the correction is just KI
+                raise NotImplementedError("QP_E_consistent_QP_Eo=True is not yet implemented and/or tested.")
+                eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands]
+                eigenvalues_KS[k,:] = self.eigenvalues_KS[where,:n_bands]
+            else:
+                # here we put the QP correction to be KI, and the KS to be the one of the ns.db1. In this way the E_minus_Eo is not the right one with respect to the KI, 
+                # but when applied to the ns.db1 KS eigenvalues it gives the right KI eigenvalues, which is what matters for Yambo.
+                eigenvalues[k,:] = self.eigenvalues_KI[where,:n_bands]
+                # use IBZ index for ns_db1_evalues (shape: n_kpoints_ibz, n_bands)
+                ibz_k = expanded_indexes[k]
+                eigenvalues_KS[k,:] = Ha*self.ns_db1_evalues[ibz_k,:n_bands]
+        
+        logger.info(f"K-point mapping complete: {n_kpoints_yambo}/{n_kpoints_yambo} matched")
         
         self.new_KI = eigenvalues.copy()
         self.new_KS = eigenvalues_KS.copy()
@@ -550,15 +997,14 @@ class KcwQpDatabaseGenerator:
         # use the KI:
         #eigenvalues = self.eigenvalues_KI + (self.eigenvalues_KS - self.ns_db1_evalues[:,:self.eigenvalues_KS.shape[1]])
 
-        print(f"Shape of the eigenvalues: {np.shape(eigenvalues)}")
+        logger.debug(f"Shape of the eigenvalues: {np.shape(eigenvalues)}")
         
         ###############################################################################
-        if not hasattr(self, 'kpoints'):
-            self.kpoints = ns.variables["K-POINTS"].values[:,:np.shape(eigenvalues)[0]] # exactly as in ndb.QP
-        else:
-            print("using the kpoints already stored.")
-        
-        self.kpoints = ns.variables["K-POINTS"].values # exactly as in ndb.QP
+        # Use the full-BZ expanded k-points (cartesian, shape (3, n_kpoints_yambo))
+        # instead of ns.db1's IBZ-only K-POINTS (shape (3, n_kpoints_ibz)).
+        # The two would differ whenever symmetry expansion is needed (e.g. 3 IBZ → 8 full-BZ),
+        # which caused PARS to report 8 k-points / 160 states while QP_table only had 60 entries.
+        self.kpoints = expanded_kpoints_car.T  # shape (3, n_kpoints_yambo)
 
         bands = [1,np.shape(eigenvalues)[0]*np.shape(eigenvalues)[1]]
 
@@ -582,9 +1028,17 @@ class KcwQpDatabaseGenerator:
         self.table = QP_table
         
         QP_E = [[E,0] for E in reshaped_eval] # [[E.real,E.imag]]
-        PARS = np.ma.array(
-            np.array([np.shape(eigenvalues)[1],np.shape(eigenvalues)[0],np.shape(eigenvalues)[0]*np.shape(eigenvalues)[1],26,-1,-1]),
-            mask = [False, False, False, False,  True,  True])
+        # PARS: [n_bands, n_kpts, n_states, n_descriptors, 0, 0]
+        # The last two entries are unused; use 0.0 (not masked) to avoid
+        # netCDF fill-value overflow when Yambo reads them as integers.
+        PARS = np.array([
+            float(np.shape(eigenvalues)[1]),  # number of bands
+            float(np.shape(eigenvalues)[0]),  # number of k-points
+            float(np.shape(eigenvalues)[0] * np.shape(eigenvalues)[1]),  # total states
+            26.0,   # number of descriptors
+            0.0,    # unused
+            0.0,    # unused
+        ], dtype=np.float32)
 
         self.QP_E = QP_E
 
@@ -599,18 +1053,35 @@ class KcwQpDatabaseGenerator:
         "PARS":PARS,
         }
 
+        # Inject the SERIAL_NUMBER from the SAVE directory so Yambo can
+        # match the ndb.QP to its own databases (ndb.gops / ndb.kindx).
+        save_dir = getattr(self, 'save_dir', None)
+        if save_dir is not None:
+            for candidate in ('ndb.gops', 'ndb.kindx'):
+                candidate_path = save_dir / candidate
+                if candidate_path.exists():
+                    try:
+                        with nc.Dataset(str(candidate_path)) as _db:
+                            if 'SERIAL_NUMBER' in _db.variables:
+                                self.mapped_vars['SERIAL_NUMBER'] = \
+                                    np.array(_db.variables['SERIAL_NUMBER'][:], dtype=np.float32)
+                        break
+                    except Exception:
+                        pass
+
         # This mapping is done onto template.QPs. You should always use them!!!
         # TODO: generalize this, to read from whatever template.QP you want.
         # or at least create a template which always work (e.g. I don't want, in the following mapping, to have to change the D_0000000001... because it is used somewhere else in the template.QP)
         self.mapped_dims = {
-            'D_0000000064': [f"D_{str(len(QP_Eo)).zfill(10)}",len(QP_Eo)], # 
-            'D_0000000077': [f"D_{str(len(QP_Eo)).zfill(10)}",len(QP_Eo)], # 
-            'D_0000000008': [f"D_{str(QP_kpts.shape[0]).zfill(10)}",QP_kpts.shape[0]], # 
-            'D_0000000007': [f"D_{str(QP_kpts.shape[1]).zfill(10)}",QP_kpts.shape[1]], # before it was shape[0], but it is not the case anymore.
+            QP_DATABASE_DIMENSIONS['QP_EO_DIM']: [f"D_{str(len(QP_Eo)).zfill(10)}",len(QP_Eo)], # 
+            QP_DATABASE_DIMENSIONS['QP_E_DIM']: [f"D_{str(len(QP_Eo)).zfill(10)}",len(QP_Eo)], # 
+            QP_DATABASE_DIMENSIONS['KPTS_DIM_X']: [f"D_{str(QP_kpts.shape[0]).zfill(10)}",QP_kpts.shape[0]], # 
+            QP_DATABASE_DIMENSIONS['KPTS_DIM_Y']: [f"D_{str(QP_kpts.shape[1]).zfill(10)}",QP_kpts.shape[1]], # before it was shape[0], but it is not the case anymore.
             #'D_0000000100': [f"D_{str(mapped_vars['QP_QP_@_state_1_b_range'][1]).zfill(10)}",mapped_vars['QP_QP_@_state_1_b_range'][1]], # 
         }
         
-        print("mapping successfully generated.")
+        logger.info("Mapping successfully generated!")
+        logger.info(f"Output will contain {self.mapped_vars['QP_QP_@_state_1_b_range'][1]} bands and {self.mapped_vars['QP_QP_@_state_1_K_range'][1]} k-points")
         
         return
     
@@ -694,14 +1165,14 @@ class KcwQpDatabaseGenerator:
         gap_KS_2 = np.round((self.QP_Eo[k_c] - self.QP_Eo[k_v])* Ha,3)
         gap_QP_2 = np.round((self.QP_E[k_c][0] - self.QP_E[k_v][0])* Ha,3)
 
-        print(f"Computed gap from QP_Eo at k-point {k_index}: {gap_QP_2} eV")
-        print(f"Computed gap from QP_E at k-point {k_index}: {gap_KS_2} eV")
+        logger.info(f"Computed gap from QP_Eo at k-point {k_index}: {gap_QP_2} eV")
+        logger.info(f"Computed gap from QP_E at k-point {k_index}: {gap_KS_2} eV")
 
         # verification
         assert abs(gap_QP_1 - gap_QP_2) < 1e-3 , "Mismatch in QP gap verification!"
         assert abs(gap_KS_1 - gap_KS_2) < 1e-3 , "Mismatch in KS gap verification!"
 
-        print("Mappings verified successfully: gaps match within tolerance of 1e-3 eV.")
+        logger.info("Mappings verified successfully: gaps match within tolerance of 1e-3 eV.")
         
     
     def generate_QP_db(self, output_filename: str = "output.QP") -> None:
@@ -882,7 +1353,7 @@ class KcwQpDatabaseGenerator:
     
 
     @classmethod
-    def from_aiida(cls, yambo_node_pk, kcw_node_pk = None, on_grid = True, template_QP_path=None, qp_template_node=None):
+    def from_aiida(cls, yambo_node_pk, kcw_node_pk = None, on_grid = True, template_QP_path=None, qp_template_node=None, spin=False):
         """Initialize the class from an AiiDA yambo and kcw node.
         
         we use the tempdir of the yambo node to init the self.ns_db1, and 
@@ -914,7 +1385,7 @@ class KcwQpDatabaseGenerator:
                     with yambocalculation.outputs.retrieved.open(filename, 'rb') as handle:
                         temp_file.write_bytes(handle.read())
                     
-                    kcwqpdatabaseGenerator = cls(ns_db1=temp_file, template_QP_path=template_QP_path)
+                    kcwqpdatabaseGenerator = cls(ns_db1=temp_file, template_QP_path=template_QP_path, spin=spin)
                     
             if qp_template_node:
                 filename = "ndb.QP"
@@ -943,18 +1414,29 @@ class KcwQpDatabaseGenerator:
         return kcwqpdatabaseGenerator
 
 
-"""Usage example:
+"""Usage example without AiiDA or hybrid (AiiDA for yambo, local for kcw):
 
 from k2y.k2y import KcwQpDatabaseGenerator
 
-converter = KcwQpDatabaseGenerator(
-    ns_db1="/path/to/ns.db1",
-    #template_QP_path="/path/to/template.QP"
-    )
+spin = True  # set to True if the KCW calculation is spin-polarized
+
+if not aiida_node:
+    converter = KcwQpDatabaseGenerator(
+        ns_db1="/path/to/ns.db1",
+        #template_QP_path="/path/to/template.QP"
+        spin=spin
+        )
+else:
+    converter = KcwQpDatabaseGenerator.from_aiida(
+        yambo_node_pk=1234,  # Replace with actual pk
+        kcw_node_pk=None,    # Replace with actual pk or None
+        #template_QP_path="/path/to/template.QP"
+        spin=spin
+        )
     
 converter.set_koopmans_eval(path="/path/to/kc.kho") # not needed if you are using AiiDA
 
-# Optional: Load k-points from pw.x input file
+# we need kpoints from the pw input
 converter.set_kpoints_from_pwinput("/path/to/pwnscf.in")
 
 converter.generate_mappings()
@@ -963,6 +1445,23 @@ converter.verify_mappings(k_index=1, top_valence=10) # adjust k_index and top_va
 
 converter.generate_QP_db("out.QP")
 
+if aiida_node: 
+    # if you are using AiiDA, generate the SinglefileData
+    # you can also use the converter.generate_QP_db_SinglefileData() method
+    new_db = converter.generate_SinglefileData_from_file("out.QP")
+    new_db.store()
+
 #converter.produce_kpoints_for_interpolation() # to produce the k-points card for the interpolation, in the kcw.x run...
 
+"""
+
+"""Usage example with AiiDA:
+
+from k2y.aiida import generate_kcw_qp_database
+
+new_db = generate_kcw_qp_database(
+    yambo_node_pk=1234,  # Replace with actual pk
+    kcw_node_pk=5678,    # Replace with actual pk
+    QP_template_node=91011 # Replace with actual pk
+    )
 """
