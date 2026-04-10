@@ -1,0 +1,58 @@
+{
+    "pw_code":           "pw@localhost",
+    "projwfc_code":      "projwfc@localhost",
+    "pw2wannier90_code": "pw2wannier90@localhost",
+    "wannier90_code":    "wannier90@localhost",
+    "kcw_code":          "kcw@localhost",
+
+    "metadata": {
+        "options": {
+            "max_wallclock_seconds": 86400,
+            "resources": {
+                "num_machines": 1,
+                "num_mpiprocs_per_machine": 12,
+                "num_cores_per_mpiproc": 1
+            },
+            "custom_scheduler_commands": "export OMP_NUM_THREADS=1"
+        }
+    },
+
+    "metadata_pw2wannier90": {
+        "options": {
+            "max_wallclock_seconds": 3600,
+            "resources": {
+                "num_machines": 1,
+                "num_mpiprocs_per_machine": 12,
+                "num_cores_per_mpiproc": 1
+            },
+            "custom_scheduler_commands": "export OMP_NUM_THREADS=1"
+        }
+    },
+
+    "metadata_projwfc": {
+        "options": {
+            "max_wallclock_seconds": 3600,
+            "resources": {
+                "num_machines": 1,
+                "num_mpiprocs_per_machine": 12,
+                "num_cores_per_mpiproc": 1
+            },
+            "custom_scheduler_commands": "export OMP_NUM_THREADS=1"
+        }
+    },
+
+    "metadata_kcw": {
+        "options": {
+            "max_wallclock_seconds": 86400,
+            "resources": {
+                "num_machines": 1,
+                "num_mpiprocs_per_machine": 12,
+                "num_cores_per_mpiproc": 1
+            },
+            "custom_scheduler_commands": "export OMP_NUM_THREADS=1"
+        }
+    },
+
+    "pencil_decomposition": ".true.",
+    "kcw_npools": 2
+}

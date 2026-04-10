@@ -13,4 +13,14 @@ The tutorials guide you through complete, end-to-end workflows using k2y.
 
     [Start the tutorial](silicon_bse.md)
 
+-   **Silicon BSE with Koopmans via AiiDA**
+
+    ---
+
+    The same BSE@Koopmans workflow for bulk silicon, but fully managed by
+    AiiDA: every calculation is submitted to a scheduler and provenance is
+    recorded automatically.
+
+    [Start the tutorial](silicon_bse_aiida.md)
+
 </div>

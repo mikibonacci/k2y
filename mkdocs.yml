@@ -71,3 +71,4 @@ nav:
 - Tutorials:
   - Introduction: tutorials/index.md
   - Silicon BSE with Koopmans: tutorials/silicon_bse.md
+  - Silicon BSE with Koopmans (AiiDA): tutorials/silicon_bse_aiida.md
