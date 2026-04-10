@@ -58,7 +58,7 @@ Internally, k2y:
 
 If you use k2y in your research, please cite:
 
-> M. Bonacci *et al.*, *k2y: bridging Koopmans Functionals and Yambo for optical spectra*, (in preparation).
+> M. Bonacci *et al.*, *Leveraging Koopmans spectral functionals for exciton characterization in materials*, (in preparation).
 
 ## Acknowledgements
 
