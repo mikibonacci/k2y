@@ -62,4 +62,4 @@ If you use k2y in your research, please cite:
 
 ## Acknowledgements
 
-Development of k2y was supported by the [MaX — Materials Design at the Exascale](http://www.max-centre.eu/) Centre of Excellence.
+Development of k2y was supported by the [MARVEL National Centre of Competence in Research](http://www.marvel-nccr.ch).
