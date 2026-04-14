@@ -12,6 +12,8 @@ The complete input files and scripts are in `examples/silicon_aiida_bse/`.
 
 ## What you need
 
+Everything you need can be installed via `pip install .[aiida]`.
+
 | Software | Purpose |
 |---|---|
 | `koopmans` + `aiida-koopmans` | Run the pKI-DFPT workflow via AiiDA |
