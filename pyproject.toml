@@ -29,6 +29,7 @@ dependencies = [
     "importlib_resources>=5.0.0",
     "ase-koopmans @ git+https://github.com/mikibonacci/ase_koopmans.git@add/pKI_diag#egg=ase-koopmans",
     "yambopy @ git+https://github.com/mikibonacci/yambopy.git@aiida-parsing#egg=yambopy",
+    "koopmans @ git+https://github.com/mikibonacci/koopmans.git@aiida/kcp",
 ]
 
 [project.urls]
@@ -39,6 +40,7 @@ dependencies = [
 aiida = [
     "aiida-core>=2.0",
     "aiida-koopmans @ git+https://github.com/mikibonacci/aiida-koopmans.git@working/before/refactoring#egg=aiida-koopmans",
+    "aiida-yambo @ git+https://github.com/mikibonacci/aiida-yambo.git@new_cleanup#egg=aiida-yambo",
 ]
 testing = [
     "pytest>=7.0",

@@ -164,7 +164,9 @@ After this step `P2Y/SAVE/` will contain `ns.db1`, `ndb.gops`, `ndb.kindx`, and 
 
 Run `kcw.x` to compute Koopmans Compliant eigenvalues on the same k-grid used in
 the NSCF step.  The example uses the DFPT-based KC approach (`kcw-ham` mode) on
-the silicon primitive cell.
+the silicon primitive cell. Explicitly, is the first example contained in the `KCW` 
+folder of the quantum ESPRESSO package. The `run.sh` script will go to that example, run 
+it there and then copy the relevant files.
 
 ```bash
 bash run.sh KOOPMANS
