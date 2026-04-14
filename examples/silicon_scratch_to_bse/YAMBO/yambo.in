@@ -37,7 +37,7 @@ BEnSteps = 1000
  1.0 | 1.0 | 1.0 |   
 %
 % BSEBands
- 4 | 5 |   
+ 3 | 6 |   
 %
 BSENGBlk = 2 Ry
 % BndsRnXs
@@ -49,3 +49,5 @@ BSENGBlk = 2 Ry
 NGsBlkXs = 2 Ry
 DysSolver =        'n'
 X_and_IO_nCPU_LinAlg_INV = 1
+BS_CPU = 1 2 2
+BS_ROLEs = k eh t

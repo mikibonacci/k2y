@@ -1,3 +1,10 @@
+# Exit immediately if any command fails, treat unset variables as errors,
+# and propagate errors through pipes.
+set -euo pipefail
+
+# Helper: print an error message and exit with the given code (default 1).
+die() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
+
 # PREFIX_ variables can be overridden by setting them in the environment
 # before calling this script, e.g.:
 #   PREFIX_YAMBO=/custom/yambo/bin bash run.sh BSE
@@ -8,7 +15,11 @@ PREFIX_K2Y=${PREFIX_K2Y:-.}
 
 PATH=$PREFIX_QE:$PREFIX_YAMBO:$PATH
 
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export PARA_PREFIX=${PARA_PREFIX:-"mpirun -np 4"}
+
 WORKDIR=`pwd`
+
 
 # Select what to run
 # Steps can be passed as arguments: bash run.sh DFT P2Y K2Y
@@ -33,6 +44,8 @@ run_step () {
 # pseudopotentials and the script itself.
 if run_step "CLEAN"; then
   echo "Cleaning generated files..."
+  # Cleanup is best-effort: missing files or unmatched globs are not errors.
+  set +e
 
   # DFT: remove output files and the pw.x scratch directory
   rm -f  DFT/scf.out DFT/nscf.out
@@ -57,9 +70,10 @@ if run_step "CLEAN"; then
 
   # K2Y: remove any generated QP databases
   rm -f  K2Y/*.QP
-  
-  rm _scheduler-std*
 
+  rm -f _scheduler-std*
+
+  set -e
   echo "...clean completed."
 fi
 
@@ -69,9 +83,9 @@ if run_step "DFT"; then
   cd DFT
   
   echo "Running SCF..."
-  $PARA_PREFIX pw.x -in scf.in > scf.out
+  $PARA_PREFIX pw.x -in scf.in > scf.out || die "SCF failed (see DFT/scf.out)"
   echo "...SCF completed, now running NSCF..."
-  $PARA_PREFIX pw.x -in nscf.in > nscf.out
+  $PARA_PREFIX pw.x -in nscf.in > nscf.out || die "NSCF failed (see DFT/nscf.out)"
   echo "NSCF completed."
   cd ..
 fi
@@ -81,17 +95,18 @@ cd $WORKDIR
 # -------- P2Y / YAMBO --------
 if run_step "P2Y"; then
   echo "Running p2y and yambo init..."
+  mkdir -p P2Y
   cd P2Y/
   if [ ! -e out ]; then
     ln -s ../DFT/out out
   fi
   cd out/aiida.save
-  $PARA_PREFIX p2y
+  $PARA_PREFIX p2y || die "p2y failed"
   cd ../..
   if [ ! -e SAVE ]; then
     ln -s out/aiida.save/SAVE SAVE
   fi
-  $PARA_PREFIX yambo
+  $PARA_PREFIX yambo || die "yambo initialisation failed"
   echo "...p2y and yambo init completed."
   cd ..
 fi
@@ -102,10 +117,11 @@ cd $WORKDIR
 if run_step "KOOPMANS"; then
   cd $PREFIX_KCW/examples/example01
   echo "Running Koopmans example for DFPT..."
-  ./run_example
+  ./run_example || die "Koopmans run_example failed"
   echo "Koopmans example completed."
 
   cd $WORKDIR
+  mkdir -p KOOPMANS
   cp -rf $PREFIX_KCW/examples/example01/results/* KOOPMANS/.
   echo "Koopmans results copied to KOOPMANS directory."
 fi
@@ -115,11 +131,13 @@ cd $WORKDIR
 # -------- K2Y --------
 if run_step "K2Y"; then
   echo "Running k2y: generating Koopmans QP database..."
+  mkdir -p K2Y
   k2y generate \
     --ns-db1   P2Y/SAVE/ns.db1 \
     --eval     KOOPMANS/Si.kcw-ham_proj.out \
     --pwinput  KOOPMANS/Si.scf.in \
-    --output   K2Y/ndb.QP
+    --output   K2Y/ndb.QP \
+    || die "k2y generate failed"
   echo "...k2y completed. Output: K2Y/ndb.QP"
 fi
 
@@ -135,6 +153,6 @@ if run_step "BSE"; then
   if [ ! -e ndb.QP ]; then
     ln -s ../K2Y/ndb.QP ndb.QP
   fi
-  $PARA_PREFIX yambo -F yambo.in -J bse
+  $PARA_PREFIX yambo -F yambo.in -J bse || die "yambo BSE run failed (see YAMBO/LOG)"
   echo "...BSE completed."
 fi

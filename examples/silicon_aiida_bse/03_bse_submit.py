@@ -69,7 +69,7 @@ METADATA_YAMBO = {"options": {
     "max_wallclock_seconds": 86400,
     "resources": {
         "num_machines": 1,
-        "num_mpiprocs_per_machine": 1,
+        "num_mpiprocs_per_machine": 4,
         "num_cores_per_mpiproc": 1,
     },
     "custom_scheduler_commands": "export OMP_NUM_THREADS=1",
@@ -79,7 +79,7 @@ METADATA_SCF = {"options": {
     "max_wallclock_seconds": 86400,
     "resources": {
         "num_machines": 1,
-        "num_mpiprocs_per_machine": 12,
+        "num_mpiprocs_per_machine": 4,
         "num_cores_per_mpiproc": 1,
     },
     "custom_scheduler_commands": "export OMP_NUM_THREADS=1",
@@ -89,7 +89,7 @@ METADATA_NSCF = {"options": {
     "max_wallclock_seconds": 86400,
     "resources": {
         "num_machines": 1,
-        "num_mpiprocs_per_machine": 12,
+        "num_mpiprocs_per_machine": 4,
         "num_cores_per_mpiproc": 1,
     },
     "custom_scheduler_commands": "export OMP_NUM_THREADS=1",
@@ -197,6 +197,8 @@ overrides_yambo = {
                 "BDmRange": [[0.1, 0.1], "eV"],
                 # Load Koopmans QP corrections
                 "KfnQPdb": "E < ./ndb.QP",
+                "BS_ROLEs":"k eh t",
+                "BS_CPU":"2 2 1",
             },
         },
         "metadata": METADATA_YAMBO,
